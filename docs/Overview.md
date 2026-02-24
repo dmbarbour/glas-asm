@@ -1,89 +1,211 @@
 # Project Overview
 
-The goal for this project is to lift assembly-language into something that I'd feel comfortable with using as a primary language.
+The goal for this project is to lift assembly-level programming into something I'll feel comfortable directly using as a primary language. A very high-level language for very low-level programming.
 
-Like any language, assembly benefits from expressive metaprogramming, non-invasive extensions, support for composition and adapter layers, flexible annotations, and a scalable module system. Such compile-time features are focus of this language.
+Like any low-level language, assembly benefits from effective composition and extension, a scalable module system, and expressive metaprogramming. As stretch goals, I'm also interested in automated verification or proof-carrying code.
 
-This is a language without a 'runtime'. The only thing we do with assembly code, other than develop and maintain it, is extract reproducible, deterministic binaries. The focus is clearly executable or linkable binaries, but extracting a GIF or similar is also okay. 
+Unlike most low-level languages, assembly is without optimizer or runtime except insofar as they are explicitly modeled by the programmer. The main operation on assembly code is to extract binaries - usually executable or linkable. Reproducibility and determinism are primary design concerns.
 
 ## Underlying Semantics
 
-We'll build upon a pure, untyped lambda calculus with lazy evaluation, annotations, and unique identifiers. I don't believe lambda calculus or lazy evaluation need further introduction.
+We build upon a pure, untyped lambda calculus with lazy evaluation and annotations. I don't believe lambda calculus or lazy evaluation need further introduction.
 
-Annotations are structured comments for tooling, applied to lambda terms. Annotations do not influence formal output from a valid assembly. However, they may raise errors (e.g. types, assertions), influence performance (e.g. memoization or acceleration), and generate auxilliary outputs (e.g. logs, cache).
+Annotations are structured comments for tooling. Annotations may help detect errors (e.g. assertions, types), generate auxilliary outputs (e.g. logs, cache), or influence compile-time performance (e.g. memoization or acceleration). However, annotations do not modify the represented binary.
 
-Unique identifiers are useful for memory allocations, multiple inheritance, and abstract data types. We borrow identity from the filesystem: a module may declare unique symbols at its toplevel. In case of metaprogramming, we thread and compose identities and use annotations to check assumptions about unique association.
+We'll build data, objects, even constraint systems as design patterns upon the lambda calculus as a foundation, relying on annotations.
 
 ## Data
 
-The assembler and assembly syntax has built-in support for common data types: numbers, lists, dicts, and symbols. Binaries are encoded as lists of small numbers (integers 0..255), but heavily optimized (e.g. finger-tree ropes). 
+We'll support a few basic data types: numbers, lists, symbols, and dicts. 
 
-Logically, all such data is Church or Scott-encoded, tagged so we can discriminate types (e.g. list vs. dict), and sealed via annotations. But we'll use efficient representations under-the-hood.
-
-I won't expound on the conventional lists and dicts, just on what needs more attention:
+Data is immutable, leveraging persistent data structure for efficient update. Logically, data is Church or Scott-encoded, but the details are abstracted. The assembler favors efficient representations under-the-hood.
 
 ### Numbers and Arithmetic
 
-We'll support bignum integers and rationals with exact arithmetic by default. It's best to be explicit about lossy operations, e.g. due to overflow or rounding.
+The assembly supports exact rational numbers and bignum arithmetic. We'll provide operators to explicitly convert to and from common binary formats. Any loss of precision is on the programmer.
+
+If high-performance number crunching is ever required for compile-time metaprogramming (cryptography, AI, physics simulation) we'll rely on annotation-guided *Acceleration* (discussed later).
+
+### Lists and Binaries
+
+We use lists for basic sequential structures at all scales, including pairs. Annotations may guide compile-time representations. To support most use cases (indexing, concatenation, slicing, deques), large lists are represented under the hood as finger-tree ropes.
+
+Binaries are simply lists of integers in range 0 to 255. However, they are recognized and heavily optimized, supporting an efficient 'is binary' test and compact encoding in memory. Ultimately, binaries are the only input and output for an assembly.
 
 ### Symbols
 
-Symbols are abstract identifiers. The only operation on symbols is to compare two symbols for equality. There are two ways to construct symbols:
+Symbols are abstract data that support exactly one observation: an equality check. Symbols may be constructed by two means:
 
-- Unique symbols may be declared at module toplevel. This is structurally limited to a small, finite number of symbols.
-- Data composed of basic lists, dicts, numbers, and symbols can be converted to a symbol. Symbols constructed from the same data are equivalent.
+- declare unique symbols at the module toplevel
+- wrap any valid dict key as an abstract symbol
 
-In context of metaprogramming, users will often combine a unique symbol with generated data to create as many symbols as needed.
+Although pure functions cannot generate unique symbols, we can abstractly borrow uniqueness from the module system. Some module syntax, e.g. defining a specification, implicitly introduces unique symbols.
 
-With annotations, we can express that a symbol is *uniquely associated* with a term, at least within the current assembly. This is useful when symbols are proxy for identity. If the same symbol is associated with two distinct terms, the assembler can report error.
+### Dictionaries and Tagged Unions
 
-### Abstract Data
+Dictionaries represent finite key-value associations. Keys are compositions of basic data (numbers, lists, symbols, dicts), forbidding incomparable types such as functions. Values may have any type.
 
-Annotations can express 'seal' and 'unseal' of terms with a symbol. Except unsealing with the same symbol, any attempt to observe or interact with sealed data will raise an error. By using a declared symbol and controlling exports, modules can robustly enforce ad hoc data abstraction.
+An unusual restriction is that dictionaries do not support iteration over keys. This is mostly because it is difficult to define a reproducible iteration order in context of declared symbols. However, we also leverage this property for *Data Abstraction*.
 
-Although our untyped lambda calculus is untyped, data abstraction effectively implements a lightweight type system. Obvious errors may even be detected ahead of evaluation.
+Tagged unions are modeled as singleton dictionaries, where the only key represents the tag. Typically, the tag is a declared symbol.
 
-## Regarding Types
+*Note:* The assembler implicitly tags all the things in another layer - numbers, lists, dicts, symbols, functions, specifications, etc.. 
 
-Earlier, I said "untyped" lambda calculus, then promptly mentioned types as one use case for annotations. 
+### Data Abstraction
+
+At the lower level, we introduce annotations to logically 'seal' and 'unseal' data with a key. Any operation on sealed data, except unsealing it with the correct key, raises an error. However, user-sealed data blocks use with pattern matching or dict keys. 
+
+At the higher level, we favor tagged data for abstraction. The inability to iterate dict keys serves effectively as a seal. But we can also express pattern matching across several candidate tags, or use tagged data as an abstract dict key.
+
+For robust abstraction, a module should declare a few symbols for use as tags or keys without exporting them. This enables the module to force construction and observation through a provided API.
+
+## Objects
+
+We'll use objects for at least two use cases:
+
+- Parameter objects: We can express parameters as mixins that override defaults. We can refactor expression of parameter lists.
+- implementation inheritance: We can express a large assembly in terms of ineriting and tweaking an existing assembly without pervasive edits.
+
+### Base Object Model
+
+An anonymous, stateless object model that supports mixin composition: `Dict -> Dict -> Dict` in roles `Base -> Self -> Instance`. Here, 'Self' represents an open fixpoint, supporting recursive definitions and overrides. 'Base' may represent a mixin target or host.
+
+        mix child parent = λbase. λself.
+            (child (parent base self) self)
+        new spec base = fix (spec base)
+        fix is lazy fixpoint
+
+### Namespace
+
+At least for the large scale, we'll favor symbols as names. Symbols can be uniquely bound to meanings, aliased for local imports. In contrast, string names like "map" or "draw" lead to conflicts when integrating contexts. We can also delete a symbol upon deprecation, resulting in clear errors. 
+
+We'll distinguish intentions to override vs. introduce a name. This allows us to raise suitable errors if the name is or is not already present. We can also support an 'intro if not defined' case. 
+
+### Parameter Objects
+
+Instead of curried arguments `A -> B -> C -> ...`, we'll favor one big parameter object for most method calls. This is applied as a mixin to override default arguments, enhancing extensibility. There are also potential benefits for refactoring of repetitive argument structures.
+
+The user syntax should implicitly build a parameter object based on parameter lists, keyword arguments, and a tacit environment. We can easily have two standard parameters then add symbols:
+
+- 'args' - list of parameters
+- 'env' - tacit environment
+- symbolic keyword args
+
+### Multiple Inheritance
+
+Multiple inheritance (MI) is convenient when merging multiple systems that derive from a shared framework. We apply a linearization algorithm (e.g. [C4](http://fare.tunes.org/files/cs/poof/ltuo.html#(part._.C4))) to ensure each component is integrated, initialized, etc. only once, and order is consistent across all merged systems.
+
+To support linearization, we can leverage unique symbols as a proxy for comparing mixin functions.
+
+### Specifications
+
+
+
+## Modularity
+
+
+
+
+
+## System Verification
+
+
+### Unique Associations
+
+*Aside:* In context of metaprogramming, it is feasible to enforce unique associations via annotations.
+
+### Types
+
+Pervasive use of tagged data supports flexible pattern matching and ad hoc polymorphism. Effectively, we have a dynamically typed language. Though, in context of compile-time metaprogramming, this 'dynamic' refers to a late stage after modules are loaded.
+
+However, it is feasible to perform static analysis to detect some errors earlier. We can introduce type annotations to guide this analysis.
+
+Usefully, type annotations can potentially express 
+
+Most types cannot say much about the assembly code, only about the metaprogramming framework. 
+
+only about the framewor
+
+Ultimately, we'll pro also want the opportunity to analyze assembly
+
+These 'types' apply to the compile-time metaprogram. It may be feasible to support some assertions that are contingent on assembly, but it certainly is not trivial.
+
+## Tests
+
+To detect errors earlier, we can support tests per assembly module. 
+
+A simple way to express tests is a simple `Integer -> Boolean` function.  
+
+To mitigate, we can express some tests per module, e.g. as assertions. 
+
+Of course, we can expres tests for modules, perhaps even per specification.  tests for modules
+
+
+
+Ideally, we can detect many errors earlier, before modules are shared. 
+
+We can perform some type inference and check for consistency issues. But 
+
+
+Although it is better to detect errors later than never, it is best to detect errors early. One relevant boundary is to detect errors within a module before it is shared and used in an assembly.
+
+We can develop static analysis leveraging dataflow, abstract interpretation, etc. to detect some errors ahead of time. But, in context of higher-order metaprogramming, inference is limited. To support analysis, we can introduce annotations 
+
+
+for assembly modules that search for problems. We can introduce type annotations to precisely describe programmer assumptions.
+
+
+
+
+
+
+given assembly languages have no runtime, and all this computation is
+
+this 'dynamic' must be understood in the context of assembly-time stages. 
+
+The 
+
+ to dynamically typed languages. 
+
+though 'dynamic' in this context refers to the 'evaluation' stage of assembly, which is still 
+
+We may benefit from analysis to  prior to evaluati
+
+Although all computation is static, we can still distinguish stages such as parse and evaluation.
+
+ Although f
+
+
+
+
+We build upon the untyped lambda calculus. However, t
+
+
+
+Static dataflow analysis can potentially detect some errors before evaluation.
+
+
+
+
+
+
+
+ may detect obvious errors, e.g. providing a number where a function is expected.
+
+The 
+
 
 I'm envisioning gradual types, partial types, using types to help detect or isolate errors. In some contexts, failure to prove a type might be a warning instead of an error, and only an active disproof is an error. 
 
 Non-trivial type checking may be separated from the assembler, run as an independent operation with its own output and debugger.
 
-## Modeling Objects
-
-Inheritance and override is useful when constructing large assemblies. We can express that a new assembly is almost the same as an old one with just a few overrides. Of course, effective use requires anticipating likely points of change.
-
-A simple object model supporting mixins is `Dict -> Dict -> Dict` in roles `Base -> Self -> Instance`. Here 'Self' represents an open fixpoint, supporting open recursion and overrides. 'Base' represents a mixin target or host system.
-
-        mix child parent = λbase.λself.
-            (child (parent base self) self)
-        new spec base = fixpoint (spec base)
-
-Unfortunately, this model does not support *multiple inheritance* (MI). Users may manually apply multiple mixins, but it's easy to accidentally duplicate or reorder operations in inconsistent ways (e.g. for mutexes or serialization).
-
-To implement MI involves constructing an intermediate dependency graph then applying a *linearization* algorithm that drops duplicates and preserves critical constraints on method resolution order (cf. [C3 or C4](http://fare.tunes.org/files/cs/poof/ltuo.html#(part._.C4))). After linearization, we fold the earlier 'mix' function.
-
-Linearization assumes an ability to compare nodes for equality. We cannot compare functions, but we can pair each function with a uniquely associated identifier as proxy. But it can be awkward to provide unique identifiers in every case.
-
-I propose to use both models: 'spec' definitions in the module toplevel with multiple inheritance, and the basic model for anonymous or short-lived objects like *Parameter Objects*. 
-
-*Note:* A potential concern with MI is collisions on 'meanings' of names. To mitigate this, we can syntactically distinguish 'introducing' a name versus overriding one. This at least lets us detect accidental collisions. Ideally, we can also resolve through aliasing.
-
-## Parameter Objects
-
-I propose one big parameter object, i.e. `ParameterObject -> Result`, as the default calling convention for user-defined functions. This offers multiple benefits:
-
-- defaults, parameter object is expressed as a mixin that 'overrides' defaults, can easily extend with new methods
-- refactoring, can build parameter objects over multiple steps, or as a composition of mixins, or other abstractions
-- var-args, generally provide positional parameters as 'args' list
-- implicit 'env', implicit parameters by default
-
-In the syntactic integration, we can reserve 'args' for positional parameters, forward 'env' by default to further calls, and treat other parameters as keyword arguments.
-
 ## 
 
+## Assembler CLI
+
+This project should develop an initial assembler executable
+
+ is parameterized by an assembly file and specification name.
 
 ## Syntax Ideas 
 
