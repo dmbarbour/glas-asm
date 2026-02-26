@@ -2,23 +2,61 @@
 
 The goal for this project is to lift assembly-level programming into something I'll feel comfortable directly using as a primary language. A very high-level language for very low-level programming.
 
-Like any low-level language, assembly benefits from effective composition and extension, a scalable module system, and expressive metaprogramming. As stretch goals, I'm also interested in automated verification or proof-carrying code.
+Like any low-level language, assembly benefits from effective composition and extension, a scalable module system, and expressive metaprogramming. As stretch goals, I'm also interested in automated verification and proof-carrying code.
 
-Unlike most low-level languages, assembly is without optimizer or runtime except insofar as they are explicitly modeled by the programmer. The main operation on assembly code is to extract binaries - usually executable or linkable. Reproducibility and determinism are primary design concerns.
+The main operation on assembly code is to extract binaries, usually executable or linkable. Proposed approach: 
 
-## Underlying Semantics
+- design language for specifying binaries in general
+- modules support CPU targets, formats like ELF, etc. 
+- optimize standard syntax and structure for assembly
 
-We build upon a pure, untyped lambda calculus with lazy evaluation and annotations. I don't believe lambda calculus or lazy evaluation need further introduction.
+Ideally, binary outputs are reproducible, fully specified within the module system, independent of assembler executable. The assembler competes on performance, support for validation, debugging experience, etc..
 
-Annotations are structured comments for tooling. Annotations may help detect errors (e.g. assertions, types), generate auxilliary outputs (e.g. logs, cache), or influence compile-time performance (e.g. memoization or acceleration). However, annotations do not modify the represented binary.
+## Why Another Language?
 
-We'll build data, objects, even constraint systems as design patterns upon the lambda calculus as a foundation, relying on annotations.
+Although any popular programming language can generate binaries, most can be disregarded due to pervasive side effects that hinder reproducibility, caching, or parallelism. I'm also wary of module systems that express location-dependent code or depend on separate package managers and lockfiles.
+
+I have other desiderata for user experience: pervasive extensibility by default, expressive metaprogramming and user-defined syntax, compose assembly projects into a larger system, type annotations as guidelines instead of trauma.
+
+If it were just the reproducibility goals, I believe Unison, F*, Dhall, CUE, and a number of other languages could be adapted. But I'm not aware of any that fit my vision for the user experience.
+
+## Module System 
+
+A module is represented by a file. Modules may reference other files within the same folder or subfolder, or remote DVCS repositories (git, hg). We forbid Parent-relative ("../") and absolute filepaths. DVCS repositories are content addressed, referring to a specific revision. 
+
+Under these constraints, every folder of assembly code is stable and location-independent, easily copied and shared between users.
+
+Addressing a few concerns:
+
+- Maintaining DVCS refs scattered across sources is painfully awkward. To mitigate, modules are parameterized, enabling separation and aggregation.
+- It is convenient to load index modules with all the functions, though we only use a few. To mitigate, modules support lazy loading and caching.
+- Remotes fail for a number of reasons. To mitigate, DVCS refs may be multi-homed: many URLs for independent forks, one revision. 
+
+By default, imports transitively propagate module parameters, serving as a tacit environment. Although this environment may contain DVCS refs, it is usually preferable to pre-import and share definitions through the tacit environment.
+
+*Note:* Files and subfolders whose names start with '.' are also forbidden to the module system. This aligns with filesystem conventions, providing an auxilliary space for tooling.
+
+## Configuration
+
+A configuration is specified in a module indicated by `GLAM_CONF` or an OS-specific default, i.e. `"~/.config/glam/conf.glam"` in Linux or `"%AppData%\glam\conf.glam"` in Windows. A small, local user configuration will typically extend a large community or company configuration from remote DVCS.
+
+The configuration is parameterized by a subset of command-line arguments and the `GLAS_OPTIONS` environment variable. The configuration controls ad hoc assembler options, e.g. per-channel parameters for logging, storage for caching, GPGPU resources for accelerating some compile-time computations. 
+
+Critically, configurations may affect assembly output: specify an initial environment, adapt the output. Reproducibility thus requires not only the same target assembly, but also the same configuration, environment variable, and relevant command-line arguments.
+
+*Note:* Users may also extract binaries directly from the initial environment, or use an inline assembly instead of a separate assembly file.
+
+## Lambda Calculus
+
+I propose to build upon a pure, untyped lambda calculus with lazy evaluation and annotations. I don't believe lambda calculus or lazy evaluation need further introduction.
+
+Annotations are structured comments for tooling. Annotations may generate auxilliary outputs (e.g. logs, cache), influence compile-time performance (e.g. memoization, acceleration), or help detect errors (e.g. assertions, types). However, other than optionally halting an erroneous computation early, annotations do not affect the assembled binary.
+
+We model data, objects, and other useful design patterns upon this simple foundation.
 
 ## Data
 
-We'll support a few basic data types: numbers, lists, symbols, and dicts. 
-
-Data is immutable, leveraging persistent data structure for efficient update. Logically, data is Church or Scott-encoded, but the details are abstracted. The assembler favors efficient representations under-the-hood.
+We support a few basic data types: numbers, lists, symbols, and dicts. Data is immutable, leveraging persistent data structure for efficient update. Logically, all data is Church or Scott-encoded, but the details are abstracted. The assembler favors efficient representations under-the-hood.
 
 ### Numbers and Arithmetic
 
@@ -28,7 +66,7 @@ If high-performance number crunching is ever required for compile-time metaprogr
 
 ### Lists and Binaries
 
-We use lists for basic sequential structures at all scales, including pairs. Annotations may guide compile-time representations. To support most use cases (indexing, concatenation, slicing, deques), large lists are represented under the hood as finger-tree ropes.
+We use lists for basic sequential structures at all scales. Annotations may guide compile-time representations. To support most use cases (indexing, concatenation, slicing, deques), large lists are often represented under the hood as finger-tree ropes. Lists may also be lazy streams. 
 
 Binaries are simply lists of integers in range 0 to 255. However, they are recognized and heavily optimized, supporting an efficient 'is binary' test and compact encoding in memory. Ultimately, binaries are the only input and output for an assembly.
 
@@ -39,80 +77,127 @@ Symbols are abstract data that support exactly one observation: an equality chec
 - declare unique symbols at the module toplevel
 - wrap any valid dict key as an abstract symbol
 
-Although pure functions cannot generate unique symbols, we can abstractly borrow uniqueness from the module system. Some module syntax, e.g. defining a specification, implicitly introduces unique symbols.
+Although pure functions cannot generate unique symbols, we can abstractly borrow uniqueness from the module system. Declared symbols are unique per import, i.e. the same file imported twice will declare distinct symbols.
 
 ### Dictionaries and Tagged Unions
 
 Dictionaries represent finite key-value associations. Keys are compositions of basic data (numbers, lists, symbols, dicts), forbidding incomparable types such as functions. Values may have any type.
 
-An unusual restriction is that dictionaries do not support iteration over keys. This is mostly because it is difficult to define a reproducible iteration order in context of declared symbols. However, we also leverage this property for *Data Abstraction*.
+An unusual restriction is that dictionaries do not support iteration over keys. This both avoids the challenges of reproducible key order and provides a simple foundation for access control.  
 
-Tagged unions are modeled as singleton dictionaries, where the only key represents the tag. Typically, the tag is a declared symbol.
-
-*Note:* The assembler implicitly tags all the things in another layer - numbers, lists, dicts, symbols, functions, specifications, etc.. 
+Tagged unions are modeled as singleton dictionaries, favoring declared symbols as keys. 
 
 ### Data Abstraction
 
-At the lower level, we introduce annotations to logically 'seal' and 'unseal' data with a key. Any operation on sealed data, except unsealing it with the correct key, raises an error. However, user-sealed data blocks use with pattern matching or dict keys. 
+Annotations can express sealing and unsealing of data with a key, such that it's an error to observe sealed data. Tagged unions serve a similar role (due to dictionaries blocking iteration): the value cannot be accessed without the key. Users should choose between annotations and tagged unions based on whether they want to support pattern matching and equality checks. 
 
-At the higher level, we favor tagged data for abstraction. The inability to iterate dict keys serves effectively as a seal. But we can also express pattern matching across several candidate tags, or use tagged data as an abstract dict key.
+Either way, robust access control involves a unique symbol in the key.
 
-For robust abstraction, a module should declare a few symbols for use as tags or keys without exporting them. This enables the module to force construction and observation through a provided API.
+### Pattern Matching
+
+Basic data is implicitly tagged, thus we can distinguish numbers, lists, symbols, dicts, objects, functions, etc.. for pattern-matching purposes. Users can effectively extend pattern matching via tagged unions.
+
+*Note:* Ideally, we'll also like to support something analogous to F#'s active patterns or Haskell's view patterns.
 
 ## Objects
 
-We'll use objects for at least two use cases:
-
-- Parameter objects: We can express parameters as mixins that override defaults. We can refactor expression of parameter lists.
-- implementation inheritance: We can express a large assembly in terms of ineriting and tweaking an existing assembly without pervasive edits.
-
-### Base Object Model
-
-An anonymous, stateless object model that supports mixin composition: `Dict -> Dict -> Dict` in roles `Base -> Self -> Instance`. Here, 'Self' represents an open fixpoint, supporting recursive definitions and overrides. 'Base' may represent a mixin target or host.
+A stateless object model supporting mixin composition: `Dict -> Dict -> Dict` in roles `Base -> Self -> Inst`. Here, 'Self' supports open recursion via deferred fixpoint. 'Base' represents the mixin target or host environment.
 
         mix child parent = λbase. λself.
             (child (parent base self) self)
-        new spec base = fix (spec base)
-        fix is lazy fixpoint
+        new spec env = fix (spec env)
+        (fix is lazy fixpoint)
 
-### Namespace
+Inheritance and override are useful tools for extensibility. We'll leverage objects for extensibility at multiple scales: functions up to multi-component assemblies.
 
-At least for the large scale, we'll favor symbols as names. Symbols can be uniquely bound to meanings, aliased for local imports. In contrast, string names like "map" or "draw" lead to conflicts when integrating contexts. We can also delete a symbol upon deprecation, resulting in clear errors. 
+*Note:* We can support 'ifdef'-like conditional behavior referring to names in 'Base'. 
 
-We'll distinguish intentions to override vs. introduce a name. This allows us to raise suitable errors if the name is or is not already present. We can also support an 'intro if not defined' case. 
+### Function Objects
 
-### Parameter Objects
+Instead of applying curried arguments of form `X -> Y -> Z -> Result`, it's often better to model a function as an object where the caller overrides 'x', 'y', and 'z', then reads 'result'. The latter supports keyword arguments with flexible ordering, defaults, and flexible extensions. For example, we can introduce arg 'w' with a default. 
 
-Instead of curried arguments `A -> B -> C -> ...`, we'll favor one big parameter object for most method calls. This is applied as a mixin to override default arguments, enhancing extensibility. There are also potential benefits for refactoring of repetitive argument structures.
+The 'Base' argument to the function object may link to the caller's environment. This provides a basis for context-dependent behavior like algebraic effects. The caller can control this environment per call site.
 
-The user syntax should implicitly build a parameter object based on parameter lists, keyword arguments, and a tacit environment. We can easily have two standard parameters then add symbols:
+I intend to make function objects the default. The underlying, untyped lambda calculus with curried arguments can be fully abstracted, hidden from users.
 
-- 'args' - list of parameters
-- 'env' - tacit environment
-- symbolic keyword args
+*Note:* In theory, we can also add a 'result2' for interested callers, but this doesn't generalize nicely to effectful functions, e.g. where 'result' is monadic.
 
-### Multiple Inheritance
+### Symbolic Names
 
-Multiple inheritance (MI) is convenient when merging multiple systems that derive from a shared framework. We apply a linearization algorithm (e.g. [C4](http://fare.tunes.org/files/cs/poof/ltuo.html#(part._.C4))) to ensure each component is integrated, initialized, etc. only once, and order is consistent across all merged systems.
+The keys within object dictionaries should generally be symbols, not strings.
 
-To support linearization, we can leverage unique symbols as a proxy for comparing mixin functions.
+Strings inevitably lead to name collisions between mixins, especially for generic, contextual names like "map" or "draw". Also, there is no feedback when a name is deprecated, and no convenient approach to private names. 
 
-### Specifications
+In contrast, we can declare unique symbols for each meaning or interface. Access to a symbol is routed through the module system instead of object dictionaries, subject to local aliasing to avoid collisions without ambiguity. If we delete or deprecate a symbol, errors are easily detected and reported. And private names are simply symbols not exported.
+
+The main concern with symbolic names is the risk of module-layer namespace clutter. Mostly a problem for the syntax layer.
+
+### Multiple Inheritance and Specifications
+
+Multiple inheritance (MI) supports a 'merge' function, a linearization algorithm, for features that build upon a shared foundation or framework. Linearization eliminates redundant mixins and ensures mixins are applied in a consistent order across all components. When there are no shared elements, this reduces simple mixin composition. 
+
+However, linearization assumes the ability to distinguish shared components. To support this, I propose to support specifications, or specs, in the module toplevel. (A 'spec' is what most OO languages call a 'class', but I feel the connotations are better.)
+
+### Checking Assumptions
+
+We must not assert properties on 'Self' because it hurts extensibility: extensions are free to make breaking changes. We must not assert properties on 'Base', excepting structurally (that specific names are defined or undefined), because definitions may refer to 'Self'. We can provide keywords for structural assertions.
+
+We are free to assert properties on the object or mixin as a whole, however. That is, the whole `Base -> Self -> Inst` structure. This could be expressed at the module toplevel, or perhaps within the object. We are also free to assert properties within individual method definitions, that only apply insofar as those methods are kept.
+
+## Effects
+
+I can easily provide a syntactic sugar for a lightweight effects system. I believe that [Oleg Kiselyov's Free-er Monads](https://okmij.org/ftp/Haskell/extensible/more.pdf) is a convenient candidate, simple and extensible. 
+
+Effects are convenient for iteratively writing out large binaries, or for modeling backtracking parsers. It is even feasible to model threads; although the scheduler would ultimately be a deterministic function, it may prove a convenient way to partition a large task, and we can feasibly parallelize via sparks (annotations to force lazy computations in worker threads).
+
+## Assembly
+
+Ideally, the assembler doesn't actually know anything about assembly. It's a binary assembler, but we'll develop a few modules that specify CPU instructions, support construction of ELF files, etc.. 
+
+But we will strive to optimize syntax for assembly. This requires support for at least writing the mnemonics and labels, likely in a monadic context. A multi-pass solution is viable but not ideal.
+
+I do have several ideas on how to improve the user experience for assembly.
+
+### Content-Addressed Memory
+
+Instead of manually managing layout, it is feasible to 'jump' to code or 'load' data and have these converted later to memory addresses based on content and metadata. For mutable targets ('.bss' or '.data') we can include a symbol in metadata to distinguish multiple instances.
+
+This design significantly simplifies metaprogramming: we can allocate resources and computed subroutines as needed without predicting them in advance. To restore control over memory layout, an assembly may define interfaces to guide layout based on provided metadata.
+
+If writing out assembly mnemonics is modeled effectfully, we can feasibly capture the data and integrate the final location after we've collected all the data.
+
+### Local Labels
+
+Content-addressed memory doesn't work for local labels used in branches and jumps. But we still cannot assume the label target is defined before it is used, i.e. we can jump to something later within the assembly program.
+
+Labels may need specialized syntax within an assembly definition.
+
+### Structured Stacks
+
+Although we can directly manipulate the stack pointer, it would be convenient if we can automatically allocate stack locations based on usage, similar to how we allocate '.bss' sections. This seems feasible if we automatically accumulate sizes for referenced stack data elements.
+
+*TBD:* Generalize so we can leverage yet again for associative heap allocations.
+
+### Libraries
+
+TBD: I never learned the details on how libraries are linked dynamically.
+
+## Verification
+
+Verification will be heavily driven by annotations. 
+
+There are two problems here: verifying the assembly process, and verifying the generated binary. In general, it's a lot easier to verify the process, so it's convenient to align verification of the generated binary with verification of the process.
+
+But it is also feasible to support something like Hoare logic at the level of registers, and build up precise descriptions of the behavior for every CPU instruction. We might need to pass resulting constraint systems to an SMT solver, perhaps as an annotation, a specialized assertion of sorts.
+
+TBD: review SMT solvers, perhaps [SHErrLoc's](https://www.cs.cornell.edu/projects/SHErrLoc/) constraint language for more precise blame.
+
+### Assertions
+
+We can easily have assertions at many layers: modules, specs or objects (as a whole), and functions (local per call). Assertions modeled as annotations cannot influence output, but we coould feasibly support effectful assertions that raise an error. Probably want to distinguish the two.
 
 
 
-## Modularity
-
-
-
-
-
-## System Verification
-
-
-### Unique Associations
-
-*Aside:* In context of metaprogramming, it is feasible to enforce unique associations via annotations.
 
 ### Types
 
@@ -199,7 +284,9 @@ I'm envisioning gradual types, partial types, using types to help detect or isol
 
 Non-trivial type checking may be separated from the assembler, run as an independent operation with its own output and debugger.
 
-## 
+## Instrumentation
+
+logging, Profiling, 
 
 ## Assembler CLI
 
@@ -238,87 +325,15 @@ With guidance from annotations, compilers may substitute user-defined functions 
 
 An especially useful pattern is to accelerate an *interpreter* for a virtual CPU or GPGPU, such that we can leverage low-level hardware for number crunching at compile-time. 
 
-## Modularity
+## 
 
-Each module is represented by a file. Modules may reference other files within the same folder or subfolder, or in remote DVCS repositories. Parent-relative ("../") and absolute filepaths are forbidden. Dependencies between modules must form a directed, acyclic graph.
-
-Under these constraints, *folders* are easily copied and shared between users or projects within a network. 
-
-To support whole-system versioning and curation, a configuration may translate DVCS refs, e.g. to redirect an unstable branch to a stable tag, or replace a distrusted repo with a privately-controlled fork.
-
-We aren't restricted to code files. Modules may load file binaries to support embedding or metaprogramming.
-
-*Note:* Module dependency graphs may grow very large. We'll rely on lazy loading, caching, and incremental compilation for performance.
-
-## Configuration
-
-A configuration is expressed as a separate module that defines a 'conf' spec. A user configuration can inherit and extend a community or company configuration from DVCS.
-
-Configurations may influence compiler output, e.g. by specifying an `Object->Object` assembly adapter or redirecting DVCS references. However, most configuration options should be non-semantic, e.g. guidance for logging, caching, JIT, GC, or hooking up resources for acceleration like GPGPUs.
-
-## Identity and Uniqueness
-
-Although the lambda calculus has no notion of extrinsic identity, the module system does (via the filesystem). With a little compiler support, modules may declare a bounded, static set of abstract, unique identifiers.
-
-Further identifiers can be computed via composition, e.g. a pair of identifiers is also a useful identifier.
-
-However, 
-
-
-
-Use cases include: 
-- abstract data types
-- multiple inheritance 
-- memory allocation
-
-In context of metaprogramming, we can work around limit of bounded static declarations by constructing relational identifiers through composition.
 
 ###
-
-## Specifications
-
-A specification or 'spec' is a toplevel module definition that supports inheritance and override of other specs. This is the main OO-inspired design pattern.
-
-Assemblies, configurations, etc. are expressed as specs. This makes it easy to express a new assembly as a slight modification to an existing assembly, or let a user configuration override a community configuration. 
-
-Multiple inheritance is convenient when composing features that build upon shared foundations, especially shared state.
 
 ## Modeling Objects
 
 ## Content-Addressed Memory
 
-When expressing the assembly, users will directly jump to code or load data addresses with reference to the code or data, not the address. When rocessing the assembly, we'll aggregate the referenced resources and allocate required memory.
-
-In case of immutable data ('.text' or '.rodata'), pure content addressing is sufficient. For mutable locations ('.data' or '.bss'), we may include a unique identifier as metadata so we can distinguish hundreds of 8-byte fields. Other metadata per field may include alignment requirements and layout hints.
-
-This design significantly simplifies metaprogramming: we can allocate resources and computed subroutines as needed without predicting them in advance. To recover control over memory layout, an assembly may define interfaces to guide layout based on metadata.
-
-## Assembly
-
-At some point, we'll be writing out a sequence of ordered, parameterized assembly mnemonics. In some cases, we'll refer to external, content-addressed definitions. In others, we might refer to local labels for branch or jump instruction. And we may freely 'inline' assembly code. 
-
-Ideally, as we write things out, we're also accumulating details such as which content-addressed structures the assembly references, or local labels for use as branch or jump targets. We may need a fixpoint or a separate pass to fill in final details.
-
-This basic structure suggests something like a monadic structure for operating on the sequence of heuristics. But it is feasible to simply build a list of operators for ad hoc processing.
-
-### Local Labels
-
-In context of jump or branch operations, we'll often reference a local label within the assembly code. The notion of content-addressed locations does not apply in this case. But we cannot assume the label target is defined before it is used, i.e. we can still jump to something later within the assembly program.
-
-### Structured Stacks
-
-Although we can directly manipulate the stack pointer, it would be convenient if we can automatically allocate stack locations based on usage, similar to how we allocate '.bss' sections. This seems feasible if we automatically accumulate sizes for referenced stack data elements.
-
-*TBD:* Generalize so we can leverage yet again for associative heap allocations.
-
-
-## Tags and Adapters
-
-We can model a tag as a namespace-layer function that, given an environment of adapters, picks one then applies it. For example, a "bar"-tagged Term, applied to `{ "foo":Op1, "bar":Op2 }`, returns `(Op2 Term)`. There are also many other ways to model tags, e.g. as singleton dictionaries. Perhaps abstract the tag encoding. 
-
-I propose to basically tag everything with a little structural info. The compiler may introduce initial tags like "list", "dict", "int", "spec", "obj", etc.. Users may introduce new tags as needed. 
-
-Pervasive use of tags effectively serves as a lightweight, dynamic type system. But it's all modeled within the untyped lambda calculus.
 
 ## Sketch of Syntax
 
