@@ -20,31 +20,33 @@ I have other desiderata for user experience: pervasive extensibility by default,
 
 If it were just the reproducibility goals, I believe Unison, F*, Dhall, CUE, and a number of other languages could be adapted. But I'm not aware of any that fit my vision for the user experience.
 
-## Module System 
+## Modularity 
 
-A module is represented by a file. Modules may reference other files within the same folder or subfolder, or remote DVCS repositories (git, hg). We forbid Parent-relative ("../") and absolute filepaths. DVCS repositories are content addressed, referring to a specific revision. 
+A module is represented by a file. Modules may reference other files within the same folder or subfolder, or content-addressed remotes. We forbid Parent-relative ("../") and absolute filepaths. The constraints ensure folders are location-independent and stable, a suitable unit for packaging and distribution.
 
-Under these constraints, every folder of assembly code is stable and location-independent, easily copied and shared between users.
+Content-addressed remotes may provide several URLs for reliability, and a configuration may supply alternative locations. Regardless of origin, we rely on a secure hash of content or DVCS revision history to identify and verify. I propose to initially support git, mercurial, and zipfiles over HTTP.
 
-Addressing a few concerns:
+Maintaining remote refs scattered across sources is painfully awkward. To mitigate, modules are parameterized. By default, we transitively propagate the parameter across imports, serving as a tacit environment. This enables users to separate and aggregate references into a few locations. But, instead of passing remotes as parameters, it is usually preferable to import immediately then pass a directly usable environment.
 
-- Maintaining DVCS refs scattered across sources is painfully awkward. To mitigate, modules are parameterized, enabling separation and aggregation.
-- It is convenient to load index modules with all the functions, though we only use a few. To mitigate, modules support lazy loading and caching.
-- Remotes fail for a number of reasons. To mitigate, DVCS refs may be multi-homed: many URLs for independent forks, one revision. 
+The assembly may also load files from the module system as binaries for further processing. Aside from embedding binaries, this is useful for metaprogramming with external DSLs. See *User-Defined Syntax*.
 
-By default, imports transitively propagate module parameters, serving as a tacit environment. Although this environment may contain DVCS refs, it is usually preferable to pre-import and share definitions through the tacit environment.
-
-*Note:* Files and subfolders whose names start with '.' are also forbidden to the module system. This aligns with filesystem conventions, providing an auxilliary space for tooling.
+*Note:* Files or subfolders whose names start with "." are also hidden from the module system, reserved for tooling. For example, we could maintain signed manifests and certificates in ".pki/" or provide a cache proof hints ".proofs/". 
 
 ## Configuration
 
-A configuration is specified in a module indicated by `GLAM_CONF` or an OS-specific default, i.e. `"~/.config/glam/conf.glam"` in Linux or `"%AppData%\glam\conf.glam"` in Windows. A small, local user configuration will typically extend a large community or company configuration from remote DVCS.
+The assembler loads a module indicated by `GLAM_CONF` or an OS-specific default, i.e. `"~/.config/glam/conf.g"` in Linux or `"%AppData%\glam\conf.g"` in Windows. A configuration is expressed as a 'conf' specification within this module. A small, local user configuration typically extends a large community or company configuration, imported from DVCS. 
 
-The configuration is parameterized by a subset of command-line arguments and the `GLAS_OPTIONS` environment variable. The configuration controls ad hoc assembler options, e.g. per-channel parameters for logging, storage for caching, GPGPU resources for accelerating some compile-time computations. 
+The configuration is parameterized by `GLAM_CONF_OPTIONS` (via override).
 
-Critically, configurations may affect assembly output: specify an initial environment, adapt the output. Reproducibility thus requires not only the same target assembly, but also the same configuration, environment variable, and relevant command-line arguments.
+A primary purpose of a configuration is to define an assembly environment, the parameter passed to assembly modules. An assembly is free to ignore your environment and substitute its own, but this allows developers to also express script-like assemblies that borrow heavily from an assumed environment.
 
-*Note:* Users may also extract binaries directly from the initial environment, or use an inline assembly instead of a separate assembly file.
+The configuration further specifies ad hoc options for logging, testing, caching, etc.. These may be runtime specific, subject to de facto standardization.
+
+## Assembly
+
+An assembly is typically specified in a separate module from the configuration. The module and specification are indicated by command-line arguments, perhaps defaulting to definition of 'asm'. An assembly spec may be further parameterized (via override) by a list of command-line arguments, e.g. after a '--' separator. The assembly specification should define a binary. 
+
+This pushes most assembly-specific logic to libraries and effective syntax. 
 
 ## Lambda Calculus
 
@@ -77,15 +79,20 @@ Symbols are abstract data that support exactly one observation: an equality chec
 - declare unique symbols at the module toplevel
 - wrap any valid dict key as an abstract symbol
 
-Although pure functions cannot generate unique symbols, we can abstractly borrow uniqueness from the module system. Declared symbols are unique per import, i.e. the same file imported twice will declare distinct symbols.
+Although pure functions cannot generate unique symbols, we can borrow from the module system. Declared symbols are unique *per import*, i.e. the same file imported twice will declare distinct symbols. This can be useful, but usually you'll often want to share through the environment.
 
 ### Dictionaries and Tagged Unions
 
-Dictionaries represent finite key-value associations. Keys are compositions of basic data (numbers, lists, symbols, dicts), forbidding incomparable types such as functions. Values may have any type.
+Dictionaries represent finite key-value associations. Keys are compositions of basic data - numbers, lists, symbols, dicts - forbidding incomparable data types such as functions. Tagged unions are simply modeled as singleton dictionaries. Values may have any type. 
 
-An unusual restriction is that dictionaries do not support iteration over keys. This both avoids the challenges of reproducible key order and provides a simple foundation for access control.  
+Dictionaries do not support iteration over symbolic keys. It is possible to implement iteration over the subset of keys that do not contain symbols, with a reproducible key order:
 
-Tagged unions are modeled as singleton dictionaries, favoring declared symbols as keys. 
+- numbers before lists before dicts
+- numbers in rational less-than order
+- lists in lexicographical order
+- dicts as lists of key-value pairs
+
+But for iteration in general, consider defining a 'keys' method or field that provides a list of relevant keys.
 
 ### Data Abstraction
 
@@ -118,45 +125,39 @@ Instead of applying curried arguments of form `X -> Y -> Z -> Result`, it's ofte
 
 The 'Base' argument to the function object may link to the caller's environment. This provides a basis for context-dependent behavior like algebraic effects. The caller can control this environment per call site.
 
-I intend to make function objects the default. The underlying, untyped lambda calculus with curried arguments can be fully abstracted, hidden from users.
+I intend to make some variation of function objects the default, likely coupled with monadic effects. 
 
-*Note:* In theory, we can also add a 'result2' for interested callers, but this doesn't generalize nicely to effectful functions, e.g. where 'result' is monadic.
-
-### Symbolic Names
-
-The keys within object dictionaries should generally be symbols, not strings.
-
-Strings inevitably lead to name collisions between mixins, especially for generic, contextual names like "map" or "draw". Also, there is no feedback when a name is deprecated, and no convenient approach to private names. 
-
-In contrast, we can declare unique symbols for each meaning or interface. Access to a symbol is routed through the module system instead of object dictionaries, subject to local aliasing to avoid collisions without ambiguity. If we delete or deprecate a symbol, errors are easily detected and reported. And private names are simply symbols not exported.
-
-The main concern with symbolic names is the risk of module-layer namespace clutter. Mostly a problem for the syntax layer.
+*Note:* In theory, we can also extend with 'result2'. But this doesn't generalize nicely to monadic result, nor to use of functions in an expression syntax.
 
 ### Multiple Inheritance and Specifications
 
-Multiple inheritance (MI) supports a 'merge' function, a linearization algorithm, for features that build upon a shared foundation or framework. Linearization eliminates redundant mixins and ensures mixins are applied in a consistent order across all components. When there are no shared elements, this reduces simple mixin composition. 
+Multiple inheritance (MI) supports merging of features that build upon a shared foundation or framework. This is modeled as a linearization algorithm, such as C3. Linearization eliminates redundant mixins and ensures shared mixins are applied in a consistent order across all components. When there are no shared elements, this reduces simple mixin composition. 
 
-However, linearization assumes the ability to distinguish shared components. To support this, I propose to support specifications, or specs, in the module toplevel. (A 'spec' is what most OO languages call a 'class', but I feel the connotations are better.)
+Linearization assumes ability to distinguish shared components. Although we cannot compare functions, it is feasible to use symbols as a proxy. I propose to support specifications, or specs, that are allocated a unique symbol when declared in the module toplevel.
+
+*Note:* A 'spec' is essentially what most OO languages call a 'class'. But I feel the connotations are better, especially with focus being implementation inheritance and not subtyping.
+
+### Symbolic Names
+
+In context of specification mixins or multiple inheritance, using strings as names leads to ambiguities and collisions. The big culprits are generic, contextual names like "map" or "draw". There are some other weaknesses, too: no feedback upon deprecating a name, no convenient approach to 'private' names local to a mixin.
+
+A robust solution is to declare unique symbols for each meaning or interface. Access to a symbol is routed through the module system, subject to qualification or aliasing. If we delete or deprecate a symbol the errors are easily detected and reported. Private names are easily modeled via symbols not exported.
+
+A relevant concern with symbolic names is risk of namespace clutter. I hope to mitigate this syntactically, e.g. with 'using' directives. Also, we might stick to strings for keyword arguments to function objects.
 
 ### Checking Assumptions
 
-We must not assert properties on 'Self' because it hurts extensibility: extensions are free to make breaking changes. We must not assert properties on 'Base', excepting structurally (that specific names are defined or undefined), because definitions may refer to 'Self'. We can provide keywords for structural assertions.
+In context of defining a mixin, most observations on 'Base' or 'Self' either compromise extensibility or diverge on fixpoint. A useful exception is observing which names are defined in 'Base': we can support 'ifdef' or check assumptions about whether a mixin introduces or overrides a name.
 
-We are free to assert properties on the object or mixin as a whole, however. That is, the whole `Base -> Self -> Inst` structure. This could be expressed at the module toplevel, or perhaps within the object. We are also free to assert properties within individual method definitions, that only apply insofar as those methods are kept.
+We still have several options: Holistic observations after a mixin or specification is defined. Define test methods for most things. Assert within method definitions.
 
 ## Effects
 
-I can easily provide a syntactic sugar for a lightweight effects system. I believe that [Oleg Kiselyov's Free-er Monads](https://okmij.org/ftp/Haskell/extensible/more.pdf) is a convenient candidate, simple and extensible. 
+It is not difficult to provide a syntactic sugar for a lightweight effects system, perhaps coupled with function objects. As for modeling effects, I believe [Oleg Kiselyov's Free-er Monads](https://okmij.org/ftp/Haskell/extensible/more.pdf) is a suitable foundation and works well with extensible tagged unions.
 
-Effects are convenient for iteratively writing out large binaries, or for modeling backtracking parsers. It is even feasible to model threads; although the scheduler would ultimately be a deterministic function, it may prove a convenient way to partition a large task, and we can feasibly parallelize via sparks (annotations to force lazy computations in worker threads).
+Effects are useful for threading state between operations, modeling backtracking parsers, error handling, writing large binaries in small steps. Even multi-threading can be modeled, breaking a large batch task into small interactive tasks. 
 
-## Assembly
-
-Ideally, the assembler doesn't actually know anything about assembly. It's a binary assembler, but we'll develop a few modules that specify CPU instructions, support construction of ELF files, etc.. 
-
-But we will strive to optimize syntax for assembly. This requires support for at least writing the mnemonics and labels, likely in a monadic context. A multi-pass solution is viable but not ideal.
-
-I do have several ideas on how to improve the user experience for assembly.
+## Assembly Ideas
 
 ### Content-Addressed Memory
 
@@ -178,26 +179,19 @@ Although we can directly manipulate the stack pointer, it would be convenient if
 
 *TBD:* Generalize so we can leverage yet again for associative heap allocations.
 
-### Libraries
-
-TBD: I never learned the details on how libraries are linked dynamically.
-
 ## Verification
 
-Verification will be heavily driven by annotations. 
+Verification is driven by annotations. Though, it may also be relaxed or disabled by configuration.
 
 There are two problems here: verifying the assembly process, and verifying the generated binary. In general, it's a lot easier to verify the process, so it's convenient to align verification of the generated binary with verification of the process.
 
 But it is also feasible to support something like Hoare logic at the level of registers, and build up precise descriptions of the behavior for every CPU instruction. We might need to pass resulting constraint systems to an SMT solver, perhaps as an annotation, a specialized assertion of sorts.
 
-TBD: review SMT solvers, perhaps [SHErrLoc's](https://www.cs.cornell.edu/projects/SHErrLoc/) constraint language for more precise blame.
+TBD: review SMT solvers, or perhaps [SHErrLoc's](https://www.cs.cornell.edu/projects/SHErrLoc/) intermediate constraint language.
 
 ### Assertions
 
 We can easily have assertions at many layers: modules, specs or objects (as a whole), and functions (local per call). Assertions modeled as annotations cannot influence output, but we coould feasibly support effectful assertions that raise an error. Probably want to distinguish the two.
-
-
-
 
 ### Types
 
