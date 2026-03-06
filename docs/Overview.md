@@ -57,7 +57,7 @@ Performance of lambda calculus is mediocre by default, and bignum arithmetic cer
 
 *Acceleration*: An annotation requests that a user-defined function is substituted by a specified built-in. The assembler performs ad hoc verification then replaces the function or emits a warning. Although we can accelerate individual functions such as matrix multiplication, the more general solution is to develop memory-safe DSLs that easily compile to CPU or GPGPU, then accelerate interpreters for those DSLs.
 
-*Parallelism*: An annotation indicates that a lazy thunk will be needed later. The assembler adds the thunk to a queue to be processed by a background worker thread. The assembler provides a number of worker threads similar to the number of cores. Depending on configuration, this can feasibly be extended to remote workers.
+*Parallelism*: A 'spark' annotation indicates that a lazy thunk will be needed later. The assembler adds the thunk to a queue to be processed by a background worker thread. The assembler provides a number of worker threads similar to the number of cores. Depending on configuration, this can feasibly be extended to remote workers.
 
 *Caching*: An annotation suggests specific functions should be memoized to avoid rework. The annotation may provide further guidance on mechanism: persistent or ephemeral, cache size and replacement policy, coarse-grained lookup table versus fine-grained decision-tree traces. Depending on configuration, and leveraging PKI signatures and certificates, it is feasible to share remote cache with a trusted community.
 
@@ -115,33 +115,78 @@ We might express assumptions about objects as a collection of named assertions. 
 
 ## Effects
 
-Even without a runtime, effects are very convenient for tacit dataflow and program decomposition. We'll use effects for writing outputs, maintaining context, parsing inputs and backtracking, non-deterministic choice for testing, etc.. Perhaps we'll even model concurrent coroutines for task-based decomposition.
+Even without a runtime, effects are convenient for tacit dataflow, backtracking and error handling, flexible composition, extensible behavior, etc.. 
 
-Oleg's paper on free-er monads (linked earlier) is developed in context of Haskell. It dedicates a lot of structure to work within Haskell's type system. In context of the untyped lambda calculus, we can ignore most of that, reducing to:
+        type Eff rq a =
+            | Yield (rq x) (x -> Eff rq a)
+            | Return a
 
-- monadic expressions return final result or yield `(request, continuation)` pairs
-- continuations as queues to lazily flatten left-associative monadic compositions
+We can roughly model free-er effects monads as either *yielding* a `(request, continuation)` pair or *returning* a final answer. We can easily introduce some syntactic sugars:
 
-The latter is a performance concern that is better resolved by the assembler, i.e. provide standard optimizations for both left-associative function composition and tail calls.
+        # (sugar)       (monadic operator)
+        a <- op1        op1 >>= \ a ->
+        b <- op2        op2 >>= \ b ->      
+        op3 a b         op3 a b
 
-In context of tagged data and uniform syntactic sugar for effects, we might introduce a standard tag for effects, e.g. `(Eff rq k)`. Then, any other tag is a final result. Handlers are simply functions that process effects. Typically, they are recursive until we return the final result from the continuation.
+        !request        (Yield request Return)
 
-        runReader env (Eff "get" k) = runReader env (k env)
-        runReader _ result = result
+We can specialize the syntactic sugar for the only monad:
 
-        runState st (Eff "get" k) = runState st (k st)
-        runState _ (Eff {"put":st'} k) = runState st' (k ())
-        runState st result = (result, st)
+        (Yield rq k1) >>= k2 = (Yield rq (k1 >>> k2))
+        (Return a) >>= k = k a
+        k1 >>> k2 = (>>= k2) . k1
 
-In practice, we'll usually want partial handlers that handle only a subset of effects, passing others onwards. This requires some additional composition:
+Yield captures all remaining operations into the continuation. Unfortunately, it's left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Directly implemented, this will unwrap and rebuild all four compositions whenever k1 yields. For performance, the right-associative structure `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` is vastly superior. 
 
-        runReaderT env (Eff "ask" k) = runReaderT env (k env)
-        runReaderT env (Eff op _) = (Eff op (runReaderT env . k))
-        runReaderT _ result = result
+The paper on freer monads discusses a performance solution for Haskell, building an intermediate queue structure. But a viable alternative for this project is to *accelerate* '>>>' (or perhaps function composition '.' more generally).
 
-Ideally, we'll have some good syntactic sugar for monads and partial handlers, covering all the use cases. Better, by only providing access use through the sugar, we can forbid `Eff` from ever appearing as data. The user pattern-matches requests, and recursion state may be reified as data in most cases.
+With freer monads, all domain logic is moved from '>>=' to the 'runner':
 
-*Note:* It is not difficult to lift monadic effects into general-purpose programming. But doing so dilutes language design, e.g. to account for runtime reasoning and performance. We'll optimize this language for assembly-time metaprogramming.
+        runReader env (Yield Ask k) = runReader env (k env)
+        runReader _ (Return result) = result
+
+        runState st (Yield Get k) = runState st (k st)
+        runState _ (Yield (Put st') k) = runState st' (k ())
+        runState st (Return result) = (result, st)
+
+        runChoice (Yield (Choose xs) k) = List.flatMap (runChoice . k) xs
+        runChoice (Return result) = List.singleton result
+
+It is feasible to build monolithic handlers for multiple effects. In context of ad hoc polymorphism, we don't need to build an explicit union of effects. We can directly compose effects. For example, we can model threads with shared state and a deterministic scheduler:
+
+        # threads + state, thread return values are ignored
+        runTS st ops (Yield Get k) = runTS st ops (k st)
+        runTS _ ops (Yield (Put st') k) = runTS st' ops (k ())
+        runTS st ops (Yield (Spawn op) k) = runTS st (op:ops) (k ())
+        runTS st (op:ops) (Yield Pause k) = runTS st (ops ++ [k]) (op ())
+        runTS st [] (Yield Pause k) = runTS st [] (k ())
+        runTS st (op:ops) (Return _) = runTS st ops (op ())
+        runTS st [] (Return _) = st
+
+In many cases, it is feasible to build stacks of runners that handle effects locally and pass the others onwards. Unfortunately, this doesn't generalize nicely to all effects. For example, we cannot backtrack effects below runChoice on the stack.
+
+        runReaderT env (Yield Ask k) = runReaderT env (k env)
+        runReaderT env (Yield rq k) = (Yield rq (runReaderT env . k))
+        runReaderT env (Return r) = r
+
+        runStateT st (Yield Get k) = runStateT st (k st)
+        runStateT _ (Yield (Put st') k) = runStateT st' (k ())
+        runStateT st (Yield rq k) = (Yield rq (runStateT st . k))
+        runStateT st (Return s) = (r, st)
+
+        # assume threads modify state lower in stack
+        runThreadT ops (Yield (Spawn op) k) = runThreadT (op:ops) (k ())
+        runThreadT (op:ops) (Yield Pause k) = runThreadT (ops ++ [k]) (op ())
+        runThreadT [] (Yield Pause k) = runThreadT [] (k ())
+        runThreadT ops (Yield rq k) = (Yield rq (runThreadT ops . k))
+        runThreadT (op:ops) (Return _) = runThreadT ops (op ())
+        runThreadT [] (Return _) = () 
+
+Ideally, we'll develop some common functions or syntactic sugars for composing effects. It doesn't seem like something I can generalize, but we can at least compose state-like effects (reader, writer, state, threads, etc.).
+
+*Note:* It is very easy to use monadic effects for general-purpose programming. However doing so dilutes language design, e.g. to account for runtime performance and safety. This project will eschew runtime effects to maintain purity of purpose.
+
+*TBD:* It might be best to distinguish monadic operations from pure functions, i.e. with explicit 'do' notation and returns. Seems difficult to support parametricity, otherwise. Ad hoc polymorphism doesn't always require parametericity, but it's a nice default.
 
 ## Modularity
 
