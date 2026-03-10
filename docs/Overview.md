@@ -57,7 +57,7 @@ Performance of lambda calculus is mediocre by default, and bignum arithmetic cer
 
 * *Acceleration*: An annotation requests that a user-defined function is substituted by a specified built-in. The assembler performs ad hoc verification then replaces the function or emits a warning. Although we can accelerate individual functions such as matrix multiplication, the more general solution is to develop memory-safe DSLs that easily compile to CPU or GPGPU, then accelerate interpreters for those DSLs.
 
-* *Parallelism*: An annotation indicates that a lazy thunk will be needed later. The assembler adds the thunk to a queue to be processed by a background worker thread. Depending on configuration, this can be extended to remote workers.
+* *Parallelism*: An annotation indicates that a lazy thunk will be needed later. The assembler adds the thunk to a queue to be processed by a background worker thread. Depending on configuration, this can be extended to remote workers. (This pattern is called 'sparks' in Haskell.)
 
 * *Caching*: An annotation suggests specific functions should be memoized to avoid rework. The annotation may provide further guidance on mechanism: persistent or ephemeral, cache size and replacement policy, coarse-grained lookup table versus fine-grained decision-tree traces. Depending on configuration, and leveraging PKI signatures and certificates, it is feasible to share remote cache with a trusted community.
 
@@ -151,11 +151,6 @@ Behavior is embodied in the runners (aka handlers). It is often convenient to ex
         runEnvT env (Yield rq k) = Yield rq (runEnvT . k)
         runEnvT _ r@(Return _) = r
 
-        -- generalize Env to effectful requests, a command shell
-        runCmdT sh (Yield (Cmd cmd) k) = sh cmd >>= runCmdT sh . k
-        runCmdT sh (Yield rq k) = Yield rq (runCmdT sh . k)
-        runCmdT _ r@(Return _) = r
-
         -- generalize State to indexed, scoped Memory
         --   memory is extensible via unique symbols
         runMemT m (Yield (Mem idx op) k) =
@@ -164,19 +159,20 @@ Behavior is embodied in the runners (aka handlers). It is often convenient to ex
                 Yield (Mem idx' op) (runMemT m . k)
               _ ->
                 match op with
-                  Get -> runMemT m (k (m[idx])) 
-                  Put v -> runMemT (m with { [idx] = v }) (k ())
+                  Get -> runMemT m (k (m.[idx])) 
+                  Put v -> runMemT (m with { [idx]: v }) (k ())
                   Del -> runMemT (m without idx) (k ())
         runMemT m (Return r) = (Return (r, m))
 
         -- cooperative threads: round-robin, no preemption
-        runThreadT (Yield rq k):ts = 
-            match rq with
-              Spawn t -> runThreadT (k ()):t:ts
-              Pause -> runThreadT (ts ++ [k ()])
-              _ -> Yield rq (runThreadT . (:ts) . k)
-        runThreadT (Return _):ts = runThreadT ts
-        runThreadT [] = return ()
+        --   (todo: semaphores, priority)
+        runThreadT (Yield rq k):ts = match rq with
+            Spawn t -> runThreadT (k ()):t:ts
+            Pause -> runThreadT (ts ++ [k ()])
+            rq -> Yield rq (runThread . (:ts) . k)
+        runThreadT (Return _):ts = match ts with
+            [] -> Return ()
+            _ -> runThreadT ts
 
         -- effectful choice, commit on Return but captures search state
         runChoiceT bt (Yield rq k) =
@@ -199,8 +195,8 @@ Behavior is embodied in the runners (aka handlers). It is often convenient to ex
 
 We can also model runners that scope effects:
 
-        -- fobid effects from escaping
-        runPure (Return result) = result
+        -- forbid effects from escaping
+        runPure (Return r) = r
         runPure (Yield _ _) = error "unhandled request in runPure"
  
         runEnv env = runPure . runEnvT env
@@ -212,27 +208,21 @@ We can also model runners that scope effects:
         runChoice (Yield _ _) = error "unhandled request in runChoice"
         runChoice (Return result) = List.singleton result
 
-        -- secure effects with bearer token
-        runSecureT auth (Yield rq k) =
-            match rq with
-            | (Auth tok rq) | (auth tok rq) -> 
-                Yield rq (runSecureT auth . k)
-            | _ -> error "unauthorized request"
-        runSecureT _ r@(Return _) = r
+We'll want a library of useful, reusable handlers. However, I hope we deliberately design handlers with flexibility and extensibility in mind. Regular users should very rarely be writing handlers.
 
-We'll need a library of useful, reusable handlers. However, we don't need a lot of handlers, just several deliberately designed handlers that flexibly cover most use cases. For example, I introduce MemT as a more-extensible State monad, and EnvT as a more-extensible Reader, because I frequently found the Haskell originals awkward to work with.
-
-*Note:* Although we can leverage effects for general-purpose programming, doing so dilutes design. Many of my design decisions about reasoning and performance are dubious in context of runtime effects. This project shall focus exclusively on assembly-time programming.
+*Note:* Although we can leverage effects for general-purpose programming, doing so would dilute design. Eschewing the runtime eliminates or ameliorates many complicating factors for reasoning and performance. So, we'll focus exclusively on binary assembly.
 
 ### Commutative Effects
 
-Monads sequence effects. Unfortunately, monads *overspecify* order in many cases. Many effects can be partially reordered without influencing outcome, yet with a significant impact on performance. Unfortunately, with free-er monads and separate runners, it's infeasible to optimize implicitly. What we can do is explicitly 'fork' subtasks then heuristically merge effects based on pending requests.
+Monads easily overspecify order. Many effects can be at partially reordered without influencing outcome, yet with a significant impact on performance. To mitigate this, it can be useful to model asynchronous and threaded effects.
+
+Asynchronous effects enable the runner to aggregate several requests from a single thread, enabling a reordering before we compute observations. Threaded effects enable the runner to examine pending requests from multiple threads before making any decisions.
 
         [(Yield BranchingQuery k1), (Yield TightConstraint k2), ...]
-        -- constraint runner: let's add TightConstraint before branching!
+        -- constraint runner: let's apply TightConstraint next!
 
-Essentially, we can context switch heuristically based on pending requests. We don't need fully commutative effects: a partial order is sufficient. In the stack transform context, to preserve structure, we might distinguish a 'main' thread that is allowed to pass requests up the stack.
-
+These techniques work very well together, e.g. we can model asynchronous interactions between threads. They also work nicely with spark-based parallelism: a runner heuristically sparks evaluation for a past request when the data becomes available, or a runner can batch-process several threaded effects then parallelize evaluation of each thread's next step.
+ 
 ## Modularity
 
 A module is represented by a file. Modules may reference other files within the same folder or subfolders, or content-addressed remote folders. We forbid Parent-relative ("../") and absolute filepaths. These constraints ensure folders are location-independent and temporally stable, yet editable by conventional means.
@@ -274,42 +264,49 @@ Unlike configuration files, assembly modules don't need the ".g" extension. The 
 
 ## User-Defined Syntax
 
-When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` should define a language object that defines a 'compile' method. Users may indicate interpretation as an alternative file extension, overriding the actual file extension.
+When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` should define a language object that defines a 'compile' method. The 'compile' is monadic, combining a parser combinator, module system tools, and writing definitions.
 
-The 'compile' method is a monadic expression with access to several effects:
+Desiderata:
 
 - parser combinator over file binary
   - integrates metadata about what we 'expect' to parse for debugging
   - maintains source location for source-mapping annotations
   - split binary into sections that are parsed separately to isolate errors
-  - multi-pass, e.g. to extract names or general structure in separate rounds
+  - multi-pass or overlay 'parses', i.e. gather structure from across file
 - gensym for unique symbols
 - import and include operations
 - write definitions instead of returning them
-  - ensures we never define things twice
-  - can skip writes from broken sections
-  - captures parse locations and dependencies
+  - track what names a section is *intended* to define, even on failure
+  - guard against defining things twice by accident, explicit overrides
+  - more robustly captures parse locations and dependencies
+- write annotations - named tests, projections, indices
 
-An important design constraint is that the front-end compiler never directly observe Base or Self arguments to a module. This significantly mitigates risk of divergence on fixpoint or compromising extensibility, at least at the module layer. It also never directly observes filepaths, mitigating risk of location dependence. Integration with debugging and isolation of errors are also valuable.
+The compiler never directly touches the Base or Self arguments. Usually, it shouldn't observe the full binary, because doing so makes it difficult to trace dependencies. Compilers do not know which file they are compiling, which ensures location independence. 
 
 ### Syntax Bootstrap
 
 If the final `Self.env.lang.[FileExt].compile` method is different from the Base version, the assembler attempts bootstrap. This involves recompiling with the Self version, repeating until fixpoint is reached.
 
         # pseudocode
-        #   args include Base, file binary
-        bootstrap(ext, args, compiler) =
-            let m = compile(compiler, args) 
+        bootstrap(ext, base, binary, compiler) =
+            let m = compile(compiler, base, binary) 
             let compiler' = 
                 m.env.lang.[ext].compile if defined
                 or builtin if ext is "g"
-                or error "no compiler found"
             if(compiler == compiler') then m else
             bootstrap(ext, args, compiler')
 
 The built-in compiler is simply treated as one more compiler in the bootstrap cycle, equivalent to itself. A module may simply delete a provided "g" implementation to avoid user-defined feature extensions. In practice, syntax bootstrapping should be relatively rare: it's expensive and easily goes wrong. 
 
 But it has some use cases. Mostly, adding features to the primary ".g" language and shifting dependencies from assembler version to module system.
+
+### Namespace Macros
+
+Namespace macros are expressed as an 'import' or 'include' without naming a file. Instead, we'll express a front-end compiler using Self for import or Base for include (but not limited to 'env.\*'), then compile an 'empty' file. Any relevant parameters should already be included in the compiler expression.
+
+Namespace macros have full access to gensym and module system loads, and thus may fully simulate a module system. There is a significant risk of divergence on fixpoint, but it's easy to detect and debug.
+
+*Note:* We don't support text macros. Most use cases for text macros are adequately handled by monadic effects, and namespace macros are better for the few exceptions. 
 
 ## Editable Projection
 
@@ -324,38 +321,52 @@ I have the idea and intention that, alongside definitions - perhaps as a form of
 
 What can we feasibly implement to support developers in reasoning about the assembly process and product?
 
-* *Testing*: Testing involves sampling behavior and judging it. I propose to model tests monadically with non-deterministic choice. Choice simplifies work sharing, parallelization, fuzzing, simulation of race conditions, etc.. Ideally, tests also support effective visualization, sorting, and graphing. This suggests reporting test conditions and outcomes as a structure that is fairly uniform between tests from the same origin. Instead of reporting only the final record at the end, it would be useful to report partial outputs. Each test may also generate a 'log' to flag events and states for future review.
+* *Testing*: Sample system behavior under various conditions, and make pass/fail judgements. Should be able to visualize test results in tables and graphs. Should support fuzzing, heuristic exploration of condtions, paralleism, and incremental computing. Ideally supports blame, too.
 
-* *Visualization*: We can easily introduce annotations for logging and profiling to obtain feedback. Plain text is very limiting. The assembler can provide a local web server or projectional editor GUI, and the 'log messages' might be expressed as renderable objects. Although immutable, interaction with visualizations is still useful for progressive disclosure, filtered views, rotating graphs, queries, etc.. (Of course, messages should *also* support a plain text rendering.)
+* *Visualization*: Start with logging and profiling, but extend to graphical views, interactions for progressive disclosure or search, etc.. Perhaps we can model log messages as 'objects' implementing many views, e.g. both plain text and GUI widgets.
 
-* *Reflection*: A peek under the hood might let us render computations in small steps to understand a problem. Access to the continuation might support testing and visualization with 'what if' scenarios. I hesitate to introduce reflection in general because it compromises type and abstraction-based reasoning. But we can safely provide a reflection API in context of assertion or logging annotations.
+* *Tracing*: Maintain metadata to trace outcomes (errors, data, etc.) back to contributing sources. There's a tradeoff between precision and performance. We can feasibly leverage reproducibility by replaying a computation under a few different tracer setups to obtain more precision.
 
-* *Tracing*: The assembler can maintain metadata to trace outcomes (errors, data, etc.) back to relevant sources - a reverse lookup index on the assembly process. Tracing will be heuristic and lossy for performance reasons, but we can use annotations to guide heuristics and potentially recompute for precision.
+* *Types*: We can annotate our assumptions about data and programs in a machine-checkable way. The assembler makes a best effort to prove or disprove types, possibly using dynamic checks. Unfortunately, gradual typing won't be very effective for sophisticated uses (phantom types, substructural types, etc.).
 
-* *Types*: Developers may annotate terms or definitions with partial types descriptors (i.e. optional, gradual typing). The assembler makes a best effort to prove or disprove types, i.e. error if disproven, warning if neither proven nor disproven. In some cases, this best-effort may be 'dynamic', examining actual arguments and return values during assembly. Aside from annotations, we can model abstract, nominative data types by controlling export of unique symbols.
+* *Abstract Interpretation*: Given a representation of a program (e.g. machine code) we can implement an 'interpreter' using variables instead of data. Users add their own assumptions about this interpretation, then we check for conflicts. Essentially, we can mechanically implement a type system scoped to our target.
 
-* *Abstract Interpretation*: Leveraging monadic effects, a library of assembly mnemonics could simultaneously 'write' machine code, maintain abstract machine states with Hoare logic, and propagate state changes through a constraint system. Users then express assumptions as additional constraints. Effectively, users are free to reinvent type systems within a limited scope.
+I envision use of type annotations to catch obvious errors in the assembly process, abstract interpretation as our primary means to reason about the product, and testing in a more ad hoc role. Visualization should build on tests and integrate nicely with a projectional editor.
 
-Note how tests and types are bound to definitions. It would not be difficult to annotate types and tests deep within functions. However, doing so hurts extensibility because we cannot update deeply embedded annotations in the same way we update definitions. In practice, even types on individual definitions may prove troublesome.
+### Integration
 
-I hope to leverage abstract interpretation as the main tool for sophisticated reasoning about assembly output. I find it easier to trust code that I control directly (as opposed to an assembler's "best effort" at types), and there is more opportunity extend or tune the reasoning. A constraint system can be very expressive, effective for phantom types, substructural types, dependent types. We can feasibly leverage explicit reasoning outside of annotations for program search.
+An relevant concern is how automated reasoning interacts with extension, especially breaking changes. Ideally, extensions can suppress expected errors and express updated assumptions. This suggests integration with the namespace, such that we can override the troublesome elements.
 
-### Constraint Systems
+We can express module-level type declarations and tests via simple naming convention, supported by front-end compilers and recognized by the assembler, perhaps `"type:foo"` and `"test:xyzzy"`. The assembler can automate testing and type checking when the module is loaded. 
 
-To support abstract interpretation, we can introduce a constraint monad. Essentially, this is a more sophisticated choice monad that remembers prior choices, binding them to variables. Relevant operations:
+For anonymous assertions, logging, embedded type annotations, etc. we might reference an abstract, static 'channel' declared at the module level. Users may override the channel to disable or reconfigure. It should be feasible to route channels from the user configuration, enabling effective user control over assertions and such.
 
-- Query properties on variables, e.g. `(x < 5)` or `(x > y)`. This returns a true/false branching *choice*. But if we already know something about the variable, e.g. that `x = 3`, then we implicitly fail the conflict branch.
-- Insist on properties, i.e. to push constraints. This is equivalent to query followed by failing the false branch. The only reason for insist is performance. (I'd use "assert", but that has other connotations in programming.)
-- Check, i.e. trigger an sat/unsat check for the current branch. Useful for performance or for a 'runConstraintT' where we want to record some metadata that we won't backtrck.
-- Choose from a list, same as runChoice. Failure is expressed as choosing from an empty list. Technically, this can be expressed with Query and a throw-away variable, so introducing Choose is for performance. 
+### Test Monad
 
-Ignoring the several performance options, this essentially reduces to Query. We need a DSL for the query, but fortunately that design is already covered: directly adapt SMTLIB2 to support acceleration! Variables shall be globally named, e.g. as `(Var "x")` in the DSL, where `"x"` may be any valid dictionary key. We'll rely on unique symbols and user-defined allocation and naming strategies to control conflicts.
+Tests can be expressed monadically with simple, useful effects:
 
-We cannot ask for the value of a variable. Potential values for 'x' knowing `(x < 5)` include 4.9999999, 4.9999998, 3.1415926, -12, etc. so asking would murder performance. Even with acceleration, we *cannot view* solutions discovered by an accelerator such as Z3 because the solution Z3 discovers certainly isn't the solution the accelerated function would discover. Only sat/unsat is safely observable. But we can extract the full constraint system and unevaluated branches upon return.
+- Choice. Non-deterministic choice will support selecting test parameters, simulating race conditions, parallelism, sharing test setup, fuzz testing, etc.. Choosing from the empty list will cancel a test, neither pass nor fail; useful if our test conditions are out of bounds.
+- Status. This may be modeled as a dict of 'public' state (like runMemT). Minimally, this record should contain test parameters and relevant outcomes. Perhaps also a log message, or list thereof. We can also represent intermediate states to support animation of a test. 
 
-Aside from analyzing for sat/unsat, it may prove useful to analyze 'blame', e.g. based on [Cornell's SHErrLoc project](https://www.cs.cornell.edu/projects/SHErrLoc/). After we isolate blame to some fragment of the output, we can trace it further to assembly sources.
+The pass/fail status is indicated by final return value.
 
-*Aside:* A constraint monad is an obvious candidate for *Commutative Effects* described earlier. The order in which constraints are pushed, branches are pruned, does not influence outcome, but can hugely impact performance. May need to add an effect for this.
+### Constraint Monad
+
+To support abstract interpretations, I propose to introduce a constraint monad and accelerate with Z3 or similar solvers. An accelerator cannot observe the *solution* Z3 discovers, but it can use the sat/unsat judgement.
+
+Relevant operations:
+
+- Query properties on variables, e.g. `(x < 5)` or `(x > y)`. This returns a true/false branching *choice*. But if we already know something about the variable, e.g. that `x = 3`, then we can drop the conflicting branch.
+- Insist on properties, i.e. to push constraints. Equivalent to query followed by failing the false branch.
+- Choose a value from a list. Equivalent to querying with a throw-away variable.
+
+Unlike a choice monad, the constraint system is something we might be interested in observing even if unsatisfiable. We can design a runner to return constraints from 'failed' branches.
+
+The DSL for queries is basically an adaptation of SMTLIB2. Variables are globals, e.g. `(Var key)` where key is any valid dictionary key. We can control conflict with globally-unique symbols, naming strategies, and lazy translations if needed.
+
+*Aside:* A constraint monad is an obvious candidate for *Commutative Effects* described earlier.
+
+
 
 
 # OLD CONTENT
