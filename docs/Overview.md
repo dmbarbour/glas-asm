@@ -153,32 +153,32 @@ Behavior is embodied in the runners (aka handlers). It is often convenient to ex
 
         -- generalize State to indexed, scoped Memory
         --   memory is extensible via unique symbols
-        runMemT m (Yield (Mem idx op) k) =
-            match idx with
-              Outer idx' -> 
-                Yield (Mem idx' op) (runMemT m . k)
-              _ ->
-                match op with
-                  Get -> runMemT m (k (m.[idx])) 
-                  Put v -> runMemT (m with { [idx]: v }) (k ())
-                  Del -> runMemT (m without idx) (k ())
+        runMemT m (Yield (Mem idx op) k) = match idx with
+            Outer idx' -> Yield (Mem idx' op) (runMemT m . k)
+            _ -> match op with
+                Get -> runMemT m (k (m.[idx])) 
+                Put v -> runMemT (m with { [idx]: v }) (k ())
+                Del -> runMemT (m without idx) (k ())
         runMemT m (Return r) = (Return (r, m))
 
-        -- cooperative threads (round robin, no preemption, no sync)
-        runThreadT (Yield (Spawn t) k):ts = runThreadT (k ()):t:ts
-        runThreadT (Yield Pause k):ts = runThreadT (ts ++ [k ()])
+        -- cooperative threads (round robin, no preemption, no sync, hierarchical)
+        runThreadT (Yield (Thread op) k):ts = match op with
+            (Spawn t) -> runThreadT (k ()):t:ts
+            Pause -> runThreadT (ts ++ [k()])
+            (Outer rq) -> Yield (Thread rq) (runThreadT . (:ts) . k)
         runThreadT (Yield rq k):ts = Yield rq (runThreadT . (:ts) . k)
         runThreadT (Return ()):ts = runThreadT ts
         runThreadT [] = Return ()
 
-        -- delimited continuations 
-        runContT (Yield (Reset op) k) = runContT op >>= runContT . k
-        runContT (Yield (Shift fn) k) = runContT (fn k)
+        -- delimited continuations (hierarchical)
+        runContT (Yield (Cont (Reset op)) k) = runContT op >>= runContT . k
+        runContT (Yield (Cont (Shift fn)) k) = runContT (fn k)
+        runContT (Yield (Cont (Outer rq)) k) = Yield (Cont rq) (runContT . k) 
         runContT (Yield rq k) = Yield rq (runContT . k)
         runContT r@(Return _) = r
 
-        -- effectful choice, commit on Return but captures search state
-        --   (initial bt: Return None)
+        -- effectful choice, halts on return but captures search state
+        --   initial bt: Return None
         runChoiceT bt (Yield (Choose x:xs) k) =
             let bt' = runChoiceT bt (Yield (Choose xs) k)
             runChoiceT bt' (k x)
@@ -221,44 +221,60 @@ These techniques work very well together, e.g. we can model asynchronous interac
 
 A module is represented by a file. Modules may reference other files within the same folder or subfolders, or content-addressed remote folders. We forbid Parent-relative ("../") and absolute filepaths. These constraints ensure folders are location-independent and temporally stable, yet editable by conventional means.
 
-A content-addressed remote folder is uniquely identified and authenticated by secure hash of content or DVCS revision history. However, they are not *located* by secure hash. Instead, a remote import may provide a list of locations (URLs), and configurations may suggest a few more. It is useful to include a DVCS tag or branch name for shallow cloning and to notify users of updates, but it cannot replace the secure hash.
+Modules are modeled as basic objects with limited effects during construction, conceptually `Dict -> Dict -> {load, gensym} Dict` (in roles `Base -> Self -> Instance`), but this is abstracted by an effects API for *User-Defined Syntax*. There are two mechanisms to integrate more modules:
 
-Modules are modeled as basic objects with limited effects during construction, roughly `Dict -> Dict -> {load, gensym} Dict` (in roles `Base -> Self -> Instance`). We aren't bothering with multiple inheritance. The Base argument receives a host environment (dict 'env') for adaptability, while Self supports overrides for extensibility. Here 'load' brings another module into scope, and 'gensym' is our source of unique identifiers. We can enforce filepath constraints on load, and also raise an error for dependency cycles.
+* *include* - bind included module's Base to host's 'current' Base; share Self. Effectively applies a module as a mixin, also treating prior definitions as mixins. Eager evaluation.
+* *import* - binds imported module's Base to a host-provided environment (e.g. `{ "env": Self.env }` by default). Defines local name to instance dictionary. Lazy loading. To 'override' an import, simply replace the definition.
 
-Aside from adaptability and extensibility, a motivating use case for parametric modules is to isolate remote references into very a few files, simplifying maintenance. Aside from one imports file per project, desired definitions should be available through 'env.\*'. We assume lazy loading and caching to support very large environments.
+Dependencies between files must form a directed acyclic graph. However, each import or include is independent for gensym and Base, and it's awkward to maintain scattered references to content-addressed remotes. In most use cases, we'll share definitions through 'env.\*' instead of loading a module twice.
 
-We provide two mechanisms to integrate modules:
-
-* *include* - bind included module's Base to host's current Base and share Self. Essentially, included module applies as mixin. 
-* *import* - bind imported module's Base to `{ "env": env }` in host, instantiate, then assign local name to returned dict.
-
-These cover two distinct use cases: include for extension, import for lazy loading. Instead of extending an import, we override the dictionary, perhaps even replace it by another import. Due to laziness, prior definitions are never loaded.
-
-Regarding 'private' definitions, they aren't difficult to model via gensym, but they hurt extensibility at this layer. It seems wiser to use plain-text names and simple naming convention like Python's `_name` at the module layer. We'll still want explicit override to resist accidents, and we'll heavily use symbolic names within object specifications.
-
-*Note:* Aliasing definitions from an imported dictionary is a separate declaration. This separation is slightly inconvenient, but the intention is clearer that we're binding to the dictionary (which is subject to override), and not to the import. 
+To ensure extensibility, there are no 'private' definitions or export controls at the module layer except via naming convention, such as Python's `"_name"`. The normal motives for private definitions are mitigated by content-addressing of remote dependencies.
 
 ### Configuration
 
-The assembler implicitly loads a module based on the `GLAM_CONF` environment variable or an OS-specific default, i.e. `"~/.config/glam/conf.g"` in Linux or `"%AppData%\glam\conf.g"` in Windows. This module specifies a configuration. A small, local user configuration typically extends a large community or company configuration, imported from DVCS.
+The assembler implicitly loads a configuration module based on the `GLAM_CONF` environment variable or an OS-specific default, i.e. `"~/.config/glam/conf.g"` in Linux or `"%AppData%\glam\conf.g"` in Windows. A small, local user configuration typically extends a large, remote community or company configuration.
 
-A configuration specifies an initial environment for the assembly module. We'll simply forward whatever the configuration defines as 'env', logically importing the assembly into the configuration. The assembly is free to ignore the user environment and substitute its own, but this provides an opportunity for adaptation or even script-like assemblies.
+The configuration serves several roles:
 
-Excepting 'env', configuration shall not influence an assembly's binary output. It may influence logging, testing, caching, GPGPU resources for acceleration, distributed computing and work sharing, etc..
+- Initial environment: we pass `{ "env": Config.env }` to the assembly, as if importing the assembly into the configuration. This environment may be arbitrarily large by relying on lazy loading.
+- Command-line macros: the configuration may define 'cli' as a function of type `List of String -> List of String`. This rewrite is applied to assembler arguments if and only if the first argument does not start with '-'. 
+- Resource management: specify which GPGPUs are available for acceleration, where to cache things and how much to retain, integrate with shared proxy cache for compilation and testing, compute additional search locations for content-addressed remotes, tune assembler JIT or GC heuristics, disable expensive tests and checks. 
+
+The configuration does not control assembly output. Relevantly, the assembly is free to reject your configured environment and substitute its own, even bootstrapping its own front-end compiler. Command-line macros influence outcomes, but users may bypass them. Resources may influence performance, error detection, debugging, but should not affect valid outcomes.
+
+To support project-specific overrides or let users share a local system configuration, `GLAM_CONF` is not limited to one file. Users may list multiple files using the same OS-specific separator as the `PATH` variable. We apply these as mixins, each file overriding those listed later.
 
 ### Assembly
 
-Any module that specifies a binary, or comes close enough for the command line to cover the gap, effectively serves as an assembly. The assembler CLI will support parameterizing an assembly-defined function with few command-line arguments, and scripting (i.e. of a mixin for an assembly).
+The assembler receives command-line arguments that express an assembly module as a list of mixins. The relevant arguments:
 
-The selected module is parameterized by the configured environment. Some assemblies may be script-like, mostly composing resources defined in this environment. Users may also extract binaries from the configured environment without reference to a separate assembly module. 
+- `(-f|--file) FileName` - list a file to include; first file is included last, overriding those listed later. Depending on the configured environment, assembly files aren't limited to ".g" (see *User-Defined Syntax*).
+- `(-s|--script).FileExt Text` - behaves as file in current working directory with the given file extension and text. As a special case, scripts may import parent-relative ("../") and absolute filepaths.
+- `-- List Of Args ...` - the assembler defines 'args' before any includes, defaulting to an empty list. If a '--' separator is included, trailing arguments are forwarded to the assembly.
 
-Unlike configuration files, assembly modules don't need the ".g" extension. The configured enviroment may define front-end compilers for other file extensions. See *User-Defined Syntax*.
+I imagine the common 'direct' usage is similar to `"glam -f File -- Args"`, while sophisticated use is left to command-line macros (see *Configuration*). Though, command-line macros might favor expressing behavior in the arguments then invoking a script, including modules based on the arguments.
 
-*Note:* The assembler has no built-in knowledge of CPU architectures or assembly mnemonics. It is feasible to 'assemble' documents, ray-traced images, JSON configuration files, websites, etc.. Multi-file assemblies can be expressed via tarball or zipfile or similar.
+The goal of an assembly module is (almost always) to specify a binary. 
+
+We'll express this as defining 'result' to a binary value or an effectful expression that yields `(Write Binary)` a number of times before returning an exit code. For streaming binary output, the latter is more robust than laziness. (Laziness can be finicky.)
+
+By default, we write the binary to standard output. However, there will be other command-line arguments to adjust this behavior, e.g. `"-o OutFile"`. The assembler can feasibly support projectional editing, debugging, and live coding, updating OutFile when there are no obvious errors.
+
+The assembler does not have any built-in knowledge of CPU architectures and machine-code mnemonics. That's left to libraries. Consequently, our binary output is not limited to executable or linkable files. We could output ray-traced images, JSON configurations, a zipfile of webpages, etc.. 
+
+### Remotes
+
+A content-addressed remote folder is uniquely identified by secure hash of content or DVCS revision history. However, they are not *located* by secure hash. When importing or including a remote module file, the user may provide a list of URLs. The user configuration may suggest a few more.
+
+For DVCS, we'll usually include a tag or branch name. This doesn't replace the hash. Instead, it is useful for shallow cloning, e.g. `"git clone -b Branch --single-branch URL"`, to control the amount of network traffic. We may need to roll back to the specified revision, but this provides a clear opportunity to detect and report available updates.
+
+We'll start with support for 'git', but may add mercurial and darcs later. Aside from hash, URL, and tag, we'll must indicate which tool to use.
 
 ## User-Defined Syntax
 
-User-defined syntax is a convenient approach to external DSLs and metaprogramming. When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` evaluate to a language object that defines 'compile'. This is also the case for the standard "g" files, but the assembler provides a built-in fallback.
+User-defined syntax is a convenient approach to external DSLs and metaprogramming, and naturally extends to graphical programming. 
+
+When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` should evaluate to a language object that defines 'compile'. This is also the case for "g" files, but in that special case the assembler provides a built-in as a fallback. The only file that must be "g" is the user configuration.
 
 A significant design challenge for user-defined syntax is integration with a development environment: tracing bugs, isolating syntax errors, visualization and editable projections, index and search, autocomplete, autoformat, etc.. The conventional solution is to develop a suite of external tools, IDE plugins, etc. for each syntax. The language object serves is intended to serve this role: aside from 'compile' it may define methods for tooling, e.g. a language-server protocol.
 
@@ -266,11 +282,10 @@ But the conventional solution is not very well integrated. It involves a lot of 
 
 Some design thoughts:
 
-- Parser combinators are a good starting point. Parser combinators can easily describe what they 'expect' to see at any given step, and they can track source location, providing effective feedback in case of syntax errors. We can extend the monad with more effects.
-- However, to simplify tracing, blame, error isolation, etc. the compiler cannot directly observe parse results. We could feasibly return some abstract data from each parse operation, and manipulate this data indirectly similar to applicative functors.
-- Observing a failed parse is equivalent to observing the binary, e.g. because we can test for 0, fail, try 1, etc.. Thus, we'll capture failure within the abstract data, too. This could be supported via something like a Maybe value from all parses. *Note:* We cannot *directly* use failure to model parse loops. But the parser effects API may provide loops as a built-in.
-- To support syntax-driven effects without observing the syntax, we may need to introduce an eval effect that lifts a user expression into the front-end compiler, e.g. `(Eval expr)`. The result of Eval is then abstracted. This effectively also supports forms of macros.
-- It is useful to support multi-pass parses, e.g. where one parse delimits the 'region' for another. This is very useful for error isolation.
+- Parser combinators are a great starting point. Parser combinators can implicitly track parse locations and describe what they 'expect' to see at any given step, providing effective feedback in case of syntax errors.
+- To simplify tracing, blame, error isolation, etc. the compiler must avoid directly observing parse results. Even parse errors must be abstracted To enforce this, we can return abstract data from parse operations by default. This might be expressed as an applicative functor. We can also provide built-in combinators for common loop structures.
+- To support syntax-driven effects without observing the syntax, we can introduce an eval effect that lifts a user expression into the front-end compiler. The result of eval is then abstracted. This effectively supports some forms of macros.
+- It is useful to support multi-pass parses. For example, a first pass might delimit the 'region' for another pass. Even if we drop the first pass result, this can be very useful for error isolation. 
 - Aside from source locations, the front-end compiler should be able to inject additional annotations on abstract nodes to support validation, visualization, editable projections, indexing, etc.. 
 - Using gensym, we can generate a unique abstract data type for the applicative per file. This is useful to control staging, i.e. it is useless to hold onto the abstract data.
 
@@ -278,7 +293,7 @@ Expressing a compiler without being able to 'see' the binary seems possible in t
 
 *Note:* We'll convert FileExt ASCII characters to lower-case and strip an initial '.', but otherwise it's just taken as a string. 
 
-### Syntax Bootstrap
+### Syntactic Bootstraps
 
 If the final `Self.env.lang.[FileExt].compile` method is different from the Base version, the assembler attempts bootstrap. This involves recompiling with the Self version, repeating until fixpoint is reached.
 
@@ -298,11 +313,13 @@ But it has some use cases. Mostly, adding features to the primary ".g" language 
 
 Some user-defined syntax may be graphical. And even for purely textual syntax, we'll often want to integrate some visualizations or provide edit widgets like color pickers. Miscellaneous observations:
 
-- At the lowest level, our editable projections will benefit from compiler integration, e.g. with lenses for editing the relevant file sources, maintaining metadata about source locations. 
-- The 'edit' half of a projectional editor is essentially limited to actual files in a local project folder. But read-only views are still useful for remote sources, read-only files in the local folder, and namespace macros.
-- We can treat a file that does not exist as equivalent to an empty file. This way, simply referring to the file is sufficient to obtain the hyperlink and a projectional editor (on the empty file).
-- It may be useful to support indexing of modules and build projectional editors from indices.
-- We'll also want to visualize outcomes, i.e. based on the final definitions with overloads. These might not be editable, but we'll want the view of outcomes to be at least spatially adjacent to the editor.
+- We can only edit terms annotated with source locations, parser context, and an encoder that converts the parse result back into source (aka lenses or prisms). 
+- Some content is naturally read-only, e.g. content-addressed remote files, read-only local files. In these cases, we can still support navigation, views, etc.. and partially-editable views are feasible.
+- Editable views benefit from some reflection, e.g. support indices and aggregated views across multiple files.
+- It is convenient to treat a file that does not exist as equivalent to an empty file for purpose of imports. This way, an import reference obtains a hyperlink and projectional editor.
+- I'll want to flexibly mix editable views with rendering test results, providing a round-trip between updates and outcomes. Interactions for filtering or progressive disclosure of tests should be possible.
+
+TBD: This is non-trivial, and I don't have a solid handle on exactly how to approach it.
 
 ## Reasoning
 
@@ -324,7 +341,7 @@ I envision use of type annotations to catch obvious errors in the assembly proce
 
 An relevant concern is how automated reasoning interacts with extension, especially breaking changes. Ideally, extensions can suppress expected errors and express updated assumptions. This suggests integration with the namespace, such that we can override the troublesome elements.
 
-We can express module-level type declarations and tests via simple naming convention, supported by front-end compilers and recognized by the assembler, perhaps `"type:foo"` and `"test:xyzzy"`. The assembler can automate testing and type checking when the module is loaded. 
+We can model module-level type declarations and tests as naming conventions, perhaps `"type:foo"` and `"test:xyzzy"`. The assembler may recognize these conventions then automate testing and type checking when the module is loaded. 
 
 For anonymous assertions, logging, embedded type annotations, etc. we might reference an abstract, static 'channel' declared at the module level. Users may override the channel to disable or reconfigure. It should be feasible to route channels from the user configuration, enabling effective user control over assertions and such.
 
@@ -345,10 +362,20 @@ Constraint systems are a convenient mechanism for abstract interpretation. We ca
 
 The DSL for constraints can be directly adapted from SMTLIB2. For variables, we can easily use `(Var symbol)` or similar, using a distinct symbol per variable. We easily can control naming conflicts between globally-unique symbols and constructed symbols with local naming strategies.
 
-In context of writing code monadically, it is convenient to build a constraint system statefully, within a monad. We can do so for assembly code, and it may also be useful to do so via the front-end compiler. Perhaps we can directly model our type systems.
+It is relatively convenient to build a constraint system statefully, within a monad, and perhaps occasionally 'Check' for sat/unsat. This is the approach I intend to pursue for assembly code.
 
-### Log Messages
+### Messages
 
+As described earlier, log messages should generally be described as *objects* that define methods such as 'text' returning the basic text view, 'icon' for a small representative image, or 'http' to provide an entire browseable web-app to explain each log output. Using objects, we may support 'flavored' views via mixins, and bind Base to to some representation of the host environment. Reflection APIs, access to source locations, etc. might be provided via Base. 
+
+Such messages benefit significantly from lazy evaluation. But they also assume the assembler doesn't immediately exit when the user is finished. We may need a command-line parameter for debug or IDE mode, where the assembler opens a GUI or local HTTP port.
+
+## Assembly-Level Programming
+
+TBD: So, we have tools to output a binary and reason about it. But how should we express machine code, concretely?
+
+
+## Standard Syntax
 
 
 
