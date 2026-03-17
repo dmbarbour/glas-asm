@@ -152,9 +152,10 @@ Behavior is embodied in the runners aka handlers. It is convenient to express 's
             Outer idx' -> Yield (Mem idx' op) (runMemT m . k)
             _ -> match op with
                 Get -> runMemT m (k (m.[idx])) 
-                Put v -> runMemT (m with { [idx]: v }) (k ())
+                Put v -> runMemT (m with { .[idx] = v }) (k ())
                 Del -> runMemT (m without idx) (k ())
-        runMemT m (Return r) = (Return (r, m))
+        runMemT m (Yield rq k) = Yield rq (runMemT m . k)
+        runMemT m (Return r) = Return (r, m)
 
         -- delimited continuations (hierarchical)
         runContT (Yield (Cont (Reset op)) k) = runContT op >>= runContT . k
@@ -174,11 +175,11 @@ Behavior is embodied in the runners aka handlers. It is convenient to express 's
         runThreadT (Return ()):ts = runThreadT ts
         runThreadT [] = Return ()
 
-We can also model runners that scope effects:
+We can also model runners that scope effects. Though, what to do with unhandled requests isn't well defined.
 
         -- forbid effects from escaping
         runPure (Return r) = r
-        runPure (Yield _ _) = error "unhandled effect in runPure"
+        runPure (Yield rq k) = error "unhandled request in runPure" 
  
         runMem m = runPure . runMemT m
         runCont = runPure . runContT
@@ -186,7 +187,7 @@ We can also model runners that scope effects:
 
         -- pure choice can be heavily optimized with laziness
         runChoice (Yield (Choice xs) k) = List.flatMap (runChoice . k) xs
-        runChoice (Yield _ _) = error "unhandled request in runChoice"
+        runChoice (Yield rq k) = error "unhandled request in runChoice"
         runChoice (Return result) = List.singleton result
 
 We'll need a library of useful, reusable handlers. However, I hope we deliberately design handlers with flexibility and extensibility in mind! Regular users should rarely feel the need to write custom handlers. Any 'good' monadic API is essentially architecting a framework.
@@ -212,17 +213,17 @@ A module is represented by a file. Modules may reference other files within the 
 
 Modules are modeled as mixins objects with limited effects during construction, conceptually `Dict -> Dict -> Eff {load | gensym} Dict` (in roles `Base -> Self -> Instance`). The module type is fully abstracted (see *User-Defined Syntax*). But we'll discuss it in these terms here.
 
-There are a few mechanisms to integrate loaded modules:
+A few mechanisms to integrate loaded modules:
 
 * *include* - bind included module's Base to host's current Base, treating prior definitions as mixins. Share Self. Effectively applies a module as a mixin. Adds arbitrary names to namespace.
-  * *include at* - apply to a dictionary defined within Base instead of directly to Base. Useful for lazy loading.
-* *import as* - equivalent to introducing a dictionary with `{ "env": Self.env }` then translating an include to that dictionary. 
+  * *include at* - scoped includes; applies to dictionary defined wihin Base instead of directly to Base.
+* *import as* - introduces a dictionary with `{ "env": Self.env }` (by default) then translate include to this dictionary. 
 
-This design ensures there is only one Self for an entire configuration or assembly. We can override names defined deeply within other modules. Although definitions aren't mutable, they'll feel mutable in context of the toplevel. Meanwhile, we can lazily load scoped includes.
+Scoping enables lazy loading. Import as vs. include at supports *Explicit Override*. Note that we do not instantiate anything: there is only one Self for an entire configuration or assembly. This maximizes extensibility, ensuring we can override names defined deeply within imported modules. 
 
 Dependencies between files must form a directed acyclic graph. However, each import or include is independent for gensym and Base, and it's awkward to maintain scattered references to content-addressed remotes. In most use cases, we'll share definitions through 'env.\*' instead of loading a module twice.
 
-Although it would not be difficult to support 'private' definitions per module (via gensym), doing so would harm extensibility and complicate the intuition of 'include'. We'll just use a convention like Python's `"_name"` at the module level. 
+Although it would not be difficult to support 'private' definitions per module (via gensym), doing so would harm extensibility and complicate intuitions of 'include'. We'll just use a convention like Python's `"_name"` at the module level and rely on *Explicit Override* to warn of issues (and content-addressed remotes, too).
 
 ### Configuration
 
@@ -232,7 +233,7 @@ The configuration serves several roles:
 
 - *Assembly environment*: define 'env'. This is passed to the assembly as if importing the assembly into the configuration, e.g. `{ "env": Config.env }`. This environment is analogous to system includes and shared libraries, supporting adaptive assembly. 
 - *Command-line macros*: if the first command-line argument to the assembler does not start with '-', we apply 'cli', which should be a function of type `List of String -> List of String` that returns valid arguments or empty list.
-- *Development environment*: Define an *Integrated Development Environment* for '-i' interactive mode. Filter outputs to standard error.
+- *Development environment*: Define a loop for '-i' interactive mode. Filter outputs to standard error if non-interactive.
 - *Resource management*: ad hoc, e.g. specify GPGPUs available for acceleration, cache locations and replacement heuristcs, history management, shared proxy compilation and cache, search locations for content-addressed remotes, tune assembler JIT or GC heuristics, control expensive tests and checks (e.g. assertions, fuzzing).
 
 Configurations never directly control assembler output: An assembly may ignore your configured environment and substitute its own. Command-line macros may always be written out long form. Resources influence performance and error detection but not a valid binary result.
@@ -284,39 +285,37 @@ By default, we expect a binary result and extract to standard output. However, t
     - still accessible in interactive mode, e.g. HTTP request
   - `(-o|--out) Destination` - output to named file or folder
 
-Although we could model folders via tarball or zipfile, making folders explicit is more convenient in context of interactive development.
+Machine-code mnemonics are left to libraries and syntactic sugars. Assuming accelerators and user-defined syntax, we can adapt this 'binary' assembler to many targets: ray tracing, typesetting, websites, simulations, blueprints, etc.. 
 
-Machine-code mnemonics are left to libraries and syntactic sugars. Assuming suitable accelerators and user-defined syntax, it should be easy to adapt the assembler to many targets: configuration files, ray tracing, typesetting, constructing websites, simulations, etc..
+### Interaction
 
-The above covers basic non-interactive extraction of a completed assembly product. But there is a lot more to say about development and debugging!
+Instead of repeatedly asking an assembler to evaluate a result, we can ask an assembler to repeatedly evaluate a result, i.e. external versus internal loops. The internal loop enables some optimizations, e.g. for incremental computing. But the main benefit is that the assembler process sticks around and is available for interrogation. Some useful possibilities: language server protocol, REPL, graphical debug views, progressive disclosure, editable projections, integrated development, etc..
 
-### Development
+The assembler shall support interactive mode via simple command-line switch:
 
-Instead of repeatedly asking an assembler to evaluate the result, we can ask an assembler to repeatedly evaluate the result, i.e. external versus internal loops. An internal loop introduces intriguing opportunities:
+- `--batch` (default) - evaluate and extract result once, return
+- `(-i|--interactive)` - maintain result, configurable interface
 
-- efficient, in-memory incremental computing
-- on-demand output (user request or libfuse)
-- interaction via HTTP, native GUI, or TUI
+To avoid cluttering command-line arguments, and to keep the executable small, the assembler asks the user configuration to define an interaction loop. The loop may observe environment variables, assembler capabilities, and assembly definitions. Thus, with a few conventions, we can specialize the loop to an assembly or task.
 
-Of these, interaction has the greatest impact on the developer experience. The assembler can implement an integrated development environment, editable projections, language server protocol, graphical and interactive visualizations with filters, sorts, progressive disclosure, etc..
+The assembler limits external effects:
 
-- `--batch` (default) - evaluate and extract result once
-- `(-i|--interactive)` - interactive mode with continuous assembly
-  - `--fuse` (tentative) - 'mount' folder to '-o' destination
+- *Filesystem:* only '-f' and `GLAM_CONF` files, siblings, and subfolders are visible. No parent-relative ("../") or absolute filepaths. The assembler cannot update read-only files.
+- *Network:* listen on configured ports for TCP or Unix Domain Sockets connections. Cannot initiate arbitrary connections. There may be a few specialized operations, e.g. for local DVCS folders or content-addressed remotes. 
+- *TTY*: Standard input and output as implicit network connection. Standard error disabled. Supports REPL or TUI.
+- *GUI*: No native GUI. Supports browser-based GUI and other 'remote' GUI protocols.
 
-Instead of cluttering the command line with dozens of interaction options, the assembler asks the configuration for a *Integrated Development Environment* (IDE), modeled as an object. This IDE receives various capabilities from the assembler, including access to environment variables and the assembly. Thus, with a few conventions, there is an opportunity for task-specific and assembly-specific tweaks without updating the configuration.
+The interaction loop shall be expressed as an object that primarily defines a transactional 'step' method. This step runs repeatedly, subject to transaction-loop optimizations: optimistic concurrency on non-deterministic choice, incremental computing, await relevant update after abort. Updates to the user configuration may influence future steps. Effects are abstracted: effectful operations use constructors linked via object Base. 
 
-The IDE does not receive general access to effects, merely enough to perform its role.  
+Interactive mode runs until voluntarily halted (via effects API) or externally killed (by OS).
 
 ### Debugging
 
-Developers support debugging via annotations, e.g. for types and tests, logs and profiles, tracing and blame. Logging extends to graphical visualizations. The assembler has built-in support for fuzz testing and property checking via non-deterministic choice in named tests.
-
-Effective debugging of assembly will inevitably depend on acceleration. With acceleration of an abstract machine, it is feasible to test machine code by emulation. With acceleration of an SMT solver, it is feasible to test machine code via abstract interpretation.
+Developers support debugging via annotations, e.g. types and tests, logs and profiles, tracing and blame. Effective debugging of assembly will inevitably depend on acceleration. With acceleration of an abstract machine, it is feasible to test machine code by emulation. With an SMT solver, it is feasible to test code via abstract interpretation.
 
 Although we do not require use of type annotations, we'll not discourage them. Enforcement is best effort, warning if an error is neither proven nor disproven. I hope to support a debuggable visualization of the typechecking process, and to support constraint-based heuristic analysis to isolate errors similar to [Cornell's SHErrLoc project](https://www.cs.cornell.edu/projects/SHErrLoc/).
 
-Debugging is best performed in context of interactive development. Access to replay greatly simplifies some tracing and analysis methods. The GUI view simplifies attention, visualization, and comprehension. And because everything *except* non-deterministic choice in named tests is highly reproducible (unlike runtime errors) it is no problem to fire up the IDE for interactive debugging. 
+Debugging is best performed in context of interactive development. Access to replay greatly simplifies some tracing and analysis methods. A GUI view simplifies attention, visualization, and comprehension. And because everything *except* non-deterministic choice in named tests is highly reproducible (unlike runtime errors) it is no problem to fire up the IDE for interactive debugging. 
 
 In non-interactive mode, we'll print some messages to standard error in a relatively conventional manner. The configuration may provide some filters. Then we instead report a number of skipped messages by domain and severity. We can heuristically cache failed tests (name, checkpoint, sequence of choices) for replay in interactive mode.
 
@@ -324,19 +323,13 @@ In non-interactive mode, we'll print some messages to standard error in a relati
 
 ### Live Programming
 
-Another process may 'run' interactive assembly output, watching for changes and integrating them. What can we easily do to improve this use case?
+Another process may continuously "run" an assembly result, watching for changes and integrating them. In context of executable machine code, this requires non-trivial setup, or at least restrictions on the function expressed by the machine code.
 
-- Windows:
-  - Readers open files with FILE_SHARE_DELETE. (They continue reading 'old' data.)
-  - Writer edits temporary file then calls ReplaceFile 
-    - or MoveFileEx with `MOVEFILE_REPLACE_EXISTING` 
-- Linux:
-  - Readers open file
-  - Writer edits temporary file then calls rename
+Although the assembler does not implement live programming directly, it should at least ensure atomic updates. That is, instead of replacing files, it first writes a temporary file then uses 'rename' in Linux or 'ReplaceFile' in Windows. Readers in Windows should then open the file in FILE_SHARE_DELETE mode.
 
-This allows the writer to proceed without waiting on readers. We can feasibly do better with shared memory and explicit double buffering, but it will require another extraction mode. (We could use a RAM disk instead.)
+In case the remote process accesses results through a network protocol such as HTTP, we should also make it easy to access an effective summary of version info, e.g. an aggregate hash of the contributing local files. We might use the hash in an in ETAG.
 
-Aside from efficient and atomic updates, it is convenient if the runner can report discovered issues, e.g. that there's a problem at byte 30467, so we can trace sources and draw the user's attention. This could be supported by an HTTP POST to the IDE running in interactive mode. 
+*Note:* If we discover writing to disk is a latency bottleneck, we can consider extending extraction modes with shared-memory double buffering or similar features. But profile first!
 
 ### History
 
@@ -397,15 +390,11 @@ Some user-defined syntax may be graphical. And even for purely textual syntax, w
 
 TBD: This is non-trivial, and I don't have a solid handle on exactly how to approach it.
 
-## Integrated Development Environment
-
-
-
 ## Reasoning
 
 What can we feasibly implement to support developers in reasoning about the assembly process and product?
 
-* *Testing*: Sample system behavior under various conditions, and make pass/fail judgements. Should be able to visualize test results in tables and graphs. Should support fuzzing, heuristic exploration of condtions, paralleism, and incremental computing. Ideally supports blame, too.
+* *Testing*: Sample system behavior under various conditions, and make pass/fail judgements. Should be able to visualize test results in tables and graphs. Should support fuzzing, heuristic exploration of conditions, parallelism, and incremental computing.
 
 * *Visualization*: Start with logging and profiling, but extend to graphical views, interactions for progressive disclosure or search, etc.. I propose to model log messages as mixins implementing multiple views. Plain text is one view, but we can feasibly render icons, interactive widgets, etc..
 
@@ -419,27 +408,29 @@ I envision use of type annotations to catch obvious errors in the assembly proce
 
 ### Integration
 
-An relevant concern is how automated reasoning interacts with extension, especially breaking changes. Ideally, extensions can suppress expected errors and express updated assumptions. This suggests integration with the namespace, such that we can override the troublesome elements.
+An relevant concern is how automated reasoning interacts with extension, especially extensions that represent breaking changes. 
 
-We can model module-level type declarations and tests as naming conventions, perhaps `"type:foo"` and `"test:xyzzy"`. The assembler may recognize these conventions then automate testing and type checking when the module is loaded. 
+Ideally, extensions have an opportunity to both suppress expected errors and 'fix' them by updating assumptions. Extensions are aligned with the namespace. This suggest it's best to align types, tests, visualizations, etc. with the namespace where feasible. The structure of this alignment is flexible, so long as it admits erasure and override.
 
-For anonymous assertions, logging, embedded type annotations, etc. we might reference an abstract, static 'channel' declared at the module level. Users may override the channel to disable or reconfigure. It should be feasible to route channels from the user configuration, enabling effective user control over assertions and such.
+There are use cases for embedded type annotations and assertions. These anonymous structures can be 'fixed' only by updating the host function. Arguably, that is exactly what should occur: when used correctly, an embedded annotation is like a fuse in a system that says 'break here if this assumption changes', and should be written to be as weak as possible.
+
+I have no doubt that embedded annotations will inevitably be used incorrectly. But worst case isn't too bad, e.g. forking the library to weaken unnecessarily tight constraints, perhaps some communication (issue reports, pull requests).
 
 ### Test Monad
 
 Tests can be expressed monadically with simple, useful effects:
 
-- Choice. Non-deterministic choice will support selecting test parameters, simulating race conditions, fuzz testing, etc.. We can choose from a list (discrete), or choose a rational number within given bounds (continuous). Choosing from an empty list will cancel a test.
-- Status. A serializable description of test parameters, summary of intermediate states, and outcomes. Test status should contain data that we might be interested in displaying within a graph. 
-  - It should be feasible to animate tests by rendering evolving status, forking on choice. Like starting with a single car on a racetrack, cloning on each decision, then rendering many crashes.
-  - The IDE should support user interaction to trim some branches, expand on others, to aid comprehension.
-- Log. A record of remarkable events during a test. Remarkable in the sense that logging is literally remarking on them.
+- Choice. Non-deterministic choice will support selecting test parameters, simulating race conditions, fuzz testing, etc.. We can choose number in a given range, integer or rational, i.e. discrete or continuous. 
+- Status. A serializable description of test parameters, summary of intermediate states, and outcomes. Test status should contain data that we might be interested in displaying within a graph or visually animating. Incomplete test status can support heuristic guidance of non-deterministic choice by users or the assembler.
+- Log. A record of remarkable events during a test. Remarkable in the sense that logging is literally remarking on them. Useful observations for debugging.
 
-Tests may return pass, fail, indeterminate, or checkpoint. On checkpoint, the test is directly restarted with its current status, thus externalizing a test loop. This enables us to record a long-running failed test nearer to the point of failure.
+Ideally, the assembler performs some abstract interpretation. Chosen values from a range can be evaluated together as a collective and partitioned into subsets as we perform comparisons. Perhaps, in the extreme, the assembler can extract constraints and evaluate tests with an SMT solver.
 
-A test runner is relatively easy to implement. But good heuristics for non-deterministic choice, focusing on branch coverage and edge conditions, are difficult. The assembler may use some simplistic heuristics to start, forcing developers be more cautious about presenting efficient choices.
+Tests may return pass, fail, indeterminate, or checkpoint. On checkpoint, a test is directly restarted with its current status, thus externalizing a test loop. This enables us to record a long-running failed test nearer to the point of failure.
 
-*Note:* We cannot afford non-deterministic choice for anonymous assertions because there is no effective way to replay them. Assertions will be simple, deterministic.
+A test runner is relatively easy to implement. But good heuristics or abstract interpretation for non-deterministic choice, focusing on branch coverage and edge conditions, is difficult. 
+
+*Note:* We cannot afford non-deterministic choice for anonymous assertions. There is no effective way to save and replay them. Assertions will be simple, deterministic. Only named tests are non-deterministic.
 
 ### Constraints
 
@@ -461,7 +452,7 @@ I'm not certain we need all the flexibility mixins provide, but I'm confident it
 
 ## Assembly-Level Programming
 
-TBD: So, we have tools to output a binary and reason about it. But how should we express machine code, concretely?
+TBD: So, assume we have tools to generate an executable binary and reason about it. But how should we express machine code, concretely?
 
 
 ## Standard Syntax
