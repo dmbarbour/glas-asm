@@ -355,8 +355,7 @@ Some design thoughts:
 - It is useful to support multi-pass parses. For example, a first pass might delimit the 'region' for another pass. Even if we drop the first pass result, this can be very useful for error isolation. 
 - Aside from source locations, the front-end compiler should be able to inject additional annotations on abstract nodes to support validation, visualization, editable projections, indexing, etc.. 
 - Using gensym, we can generate a unique abstract data type for the applicative per file. This is useful to control staging, i.e. it is useless to hold onto the abstract data.
-- Users should never directly see module Base or Self, and we should restrict module-level names to strings.
-  - Might also restrict object-level names to symbols.
+- Users should never directly see module Base or Self. We should restrict module-level names to strings. This simplifies translation for 'include at'. We can simultaneously restrict object-level names to symbols.
 
 Expressing a compiler without being able to 'see' the binary seems possible in theory, but I'm not entirely convinced that we won't reintroduce the tracing problem via Eval. To gain confidence, I must try it first with the standard syntax. After all, we should be able to override and extend the standard syntax, too. Worst case, I'm back to the conventional approach.
 
@@ -394,7 +393,7 @@ TBD: This is non-trivial, and I don't have a solid handle on exactly how to appr
 
 What can we feasibly implement to support developers in reasoning about the assembly process and product?
 
-* *Testing*: Sample system behavior under various conditions, and make pass/fail judgements. Should be able to visualize test results in tables and graphs. Should support fuzzing, heuristic exploration of conditions, parallelism, and incremental computing.
+* *Testing*: Sample system behavior under various conditions, make pass/fail judgements. We should be able to visualize tests in tables and graphs, and the test process in many cases. Should support fuzzing, heuristic exploration of conditions, parallelism, and incremental computing.
 
 * *Visualization*: Start with logging and profiling, but extend to graphical views, interactions for progressive disclosure or search, etc.. I propose to model log messages as mixins implementing multiple views. Plain text is one view, but we can feasibly render icons, interactive widgets, etc..
 
@@ -414,23 +413,40 @@ Ideally, extensions have an opportunity to both suppress expected errors and 'fi
 
 There are use cases for embedded type annotations and assertions. These anonymous structures can be 'fixed' only by updating the host function. Arguably, that is exactly what should occur: when used correctly, an embedded annotation is like a fuse in a system that says 'break here if this assumption changes', and should be written to be as weak as possible.
 
-I have no doubt that embedded annotations will inevitably be used incorrectly. But worst case isn't too bad, e.g. forking the library to weaken unnecessarily tight constraints, perhaps some communication (issue reports, pull requests).
+Embedded annotations will inevitably be used incorrectly. But worst case isn't too bad, e.g. override a few definitions or fork a library to weaken unnecessarily tight constraints. Maybe communicate a little (issue reports, pull requests).
 
-### Test Monad
+Overall conclusion here: no new constraints, but enable and encourage 'named' tests, types, visualizations, etc..
 
-Tests can be expressed monadically with simple, useful effects:
+### Tests
 
-- Choice. Non-deterministic choice will support selecting test parameters, simulating race conditions, fuzz testing, etc.. We can choose number in a given range, integer or rational, i.e. discrete or continuous. 
-- Status. A serializable description of test parameters, summary of intermediate states, and outcomes. Test status should contain data that we might be interested in displaying within a graph or visually animating. Incomplete test status can support heuristic guidance of non-deterministic choice by users or the assembler.
-- Log. A record of remarkable events during a test. Remarkable in the sense that logging is literally remarking on them. Useful observations for debugging.
+Requirements for tests:
 
-Ideally, the assembler performs some abstract interpretation. Chosen values from a range can be evaluated together as a collective and partitioned into subsets as we perform comparisons. Perhaps, in the extreme, the assembler can extract constraints and evaluate tests with an SMT solver.
+- non-deterministic choice to support fuzz testing, simulate race conditions, etc..
+  - both discrete and continuous, e.g. integers and rationals
+  - assembler may use abstract interpretation to guide choice 
+- status for test parameters and outcomes, a record we can graph, visualize, animate
+- log outputs, not just as annotations but as something we can place on test timeline
+- return a pass/fail judgement
 
-Tests may return pass, fail, indeterminate, or checkpoint. On checkpoint, a test is directly restarted with its current status, thus externalizing a test loop. This enables us to record a long-running failed test nearer to the point of failure.
+Monadic expression of tests is well-aligned to these goals. However, users cannot implement handlers for non-deterministic choice or abstract interpretations. Testing will require assembler support. The assembler may heuristically or configurably cache tests to reduce rework and support regression testion. This involves capturing a continuation and sequence of non-deterministic choices (or ranges of choices). For long-running tests, the assembler can also maintain intermediate checkpoints for efficient replay.
 
-A test runner is relatively easy to implement. But good heuristics or abstract interpretation for non-deterministic choice, focusing on branch coverage and edge conditions, is difficult. 
+In interactive mode, it is feasible to continue fuzzing indefinitely. On updates, some old tests may become 'stale' based on incremental computing. It might be useful to visualize stale tests together with new ones, perhaps distinguishing by color. In non-interactive mode, we'll want configurable, heuristic quotas for how much testing to perform.
 
-*Note:* We cannot afford non-deterministic choice for anonymous assertions. There is no effective way to save and replay them. Assertions will be simple, deterministic. Only named tests are non-deterministic.
+### Types
+
+The underlying lambda calculus is untyped, but we can express type annotations. I imagine type annotations will be incomplete, partial, gradual. The assembler makes a 'best effort' to either verify or contradict type annotations ahead of evaluation. If types are neither proven nor disproven, the assembler emits a warning. 
+
+There are no 'dynamic' type checks during evaluation. Although feasible, dynamic typing has unpredictable performance implications and hinders type-level debugging. That said, dynamic checks may be useful for heuristically tracing blame.
+
+Under these constraints, what types can we express?
+
+- structural data types: numbers, lists, symbols, dicts, tagged unions. We can refine common number types such as rational, integer, or natural. Dictionaries and tagged unions may be 'open' to extension with new cases.
+- user-defined nominative types: via tagged unions with guaranteed-unique symbols. Ideally, we can express GADTs and dependent types, so we can express our assumptions even when we cannot fully check them.
+- substructural types and session types are feasible within limited scopes. Modeling them in effects handlers is probably the most relevant, e.g. to model channels typed with protocols. 
+
+We cannot directly express type-indexed behavior, i.e. no typeclasses, operator overloading, or multimethods. Annotations cannot influence outcomes. But it is feasible to ensure types are aligned with structure in some way to simulate type-indexed behavior.
+
+*Note:* Type checking in context of gradual types remains vague to me. My intuition is that these should clear up a lot once we start defining a language of type descriptions.
 
 ### Constraints
 
@@ -442,18 +458,18 @@ It is relatively convenient to build a constraint system statefully, within a mo
 
 ### Messages
 
-I propose to model 'messages' as mixins. 
+I propose to model log messages as mixins. In the simplest case, a message defines 'text' for printing to a console. But we can feasibly extend the message with multiple views and metadata for search and filter. Mixins can easily express templated messages with good defaults. And the assembler may provide some reflection capabilities, access to locations, etc. as arguments to Base.
 
-In the simplest case, a message may define 'text' with a string. But we can extend the message with methods for multiple views (e.g. svg, http, [typst](https://typst.app/)) and metadata for search and filtration (priority, domain, etc.). We can express templated methods, and easily extend the templates. The system can provide some metadata through Base, e.g. about source locations or continuations, that would violate abstractions normally.
+Although messages are stateless, it seems useful to model session-local (or user-local) state for stateful views, such as progressive disclosure.
 
-Although messages are stateless, it may be useful to model stateful sessions or interactions with them to support dynamic views, queries, filters, progressive disclosure, etc.. This can be supported monadically, e.g. one memory monad per 'session', allowing for branching sessions and trivial undo.
+## Assembly Programming
 
-I'm not certain we need all the flexibility mixins provide, but I'm confident it won't hurt. But we'll be depending heavily on lazy evaluation for performance.
+Instead of machine-code mnemonics being something an assembler *interprets*, we can model them as monadic operations that the assembler *executes*. Each mnemonic can:
 
-## Assembly-Level Programming
+- write some binary data to intermediate staging location
+- maintain an abstract representation of program state
 
-TBD: So, assume we have tools to generate an executable binary and reason about it. But how should we express machine code, concretely?
-
+Instead of explicit layout of all .text, .data, and .rodata elements, it is feasible to support content-addressed declarative layout. For precise control of layout, then, we can support some additional declarations per allocation.
 
 ## Standard Syntax
 
