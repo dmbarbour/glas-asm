@@ -89,7 +89,7 @@ Inheritance and override is a useful mechanism for extensibility. For example, w
 
 Note that implementation inheritance is the focus, not subtyping or substitutability. Extensibility is producing useful variations of a system without invasive edits. But useful variation doesn't imply monotonic updates. For example, it might be useful to disable a parse rule to restrict a language.
 
-*Aside:* I'll call 'specification' or 'spec' what most OO languages call 'class'. I feel specification has cleaner connotations, notably avoiding connotations of subtyping.
+*Aside:* I'll call 'specification' or 'spec' what most OO languages call 'class'. I feel specification has cleaner connotations, notably avoiding connotations of subtyping. 
 
 ### Explicit Override
 
@@ -109,13 +109,11 @@ Tags don't need to be globally unique but must not be reused in scope of lineari
 
 Using short strings as method names, especially generic and context-dependent names like "map" or "draw", easily leads to ambiguities and collisions, especially in context of multiple inheritance or dynamic mixins. There are other weaknesses: no clear mechanism for private names, no feedback on deprecating names.
 
-A robust alternative is symbolic names. 
+A robust alternative is symbolic names. Modules may generate unforgeable symbols upon import, then export them. By using symbols as method names, we eliminate ambiguity and we gain object-capability security for individual methods, a secure yet flexible basis for privacy.
 
-Modules may generate unforgeable symbols upon import, then export them. By using symbols as method names, we eliminate ambiguity and we gain object-capability security for individual methods, a secure yet flexible basis for privacy.
+At external tooling boundaries, e.g. log message objects or language objects for user-defined syntax, it is awkward to reference names through the module system. In these cases, we can still construct unambiguous symbols based on DNS, e.g `symbol("glam-lang.org/2026/log/text")`.
 
-At external tooling boundaries, e.g. logging or IDE, it is awkward to reference names through the module system. Instead, we'll construct global symbols such as `symbol("glam-lang.org/2026/log/text")`. We can at least ensure these symbols are unambiguous based on naming convention.
-
-At the module layer, we're effectively stuck with short strings: they're necessary for concise syntax! But modules are constrained in other ways that mitigate concerns of collision: no multiple inheritance, static mixins only (via include). Also, *Explicit Override* still applies, and the module dictionary is abstracted.
+At the module layer, we're effectively stuck with short strings: they're necessary for concise syntax! But modules are constrained in other ways that mitigate concerns of collision: no multiple inheritance, static mixins only (via include), and *explicit override* still applies.
 
 ## Effects
 
@@ -209,7 +207,7 @@ These techniques work well together, e.g. we can buffer asynchronous requests lo
 
 ## Modularity
 
-A module is represented by a file. Modules may reference other files within the same folder or subfolders, or a content-addressed remote. We forbid Parent-relative ("../") and absolute filepaths. These constraints ensure folders are location-independent and temporally stable, yet editable by conventional means.
+A module is represented by a file. Modules may reference other files within the same folder or subfolders, or a content-addressed remote. We forbid Parent-relative ("../") and absolute filepaths. These constraints ensure folders are location-independent and temporally stable, yet editable by conventional means. 
 
 Modules are modeled as mixins objects with limited effects during construction, conceptually `Dict -> Dict -> Eff {load | gensym} Dict` (in roles `Base -> Self -> Instance`). The module type is fully abstracted (see *User-Defined Syntax*). But we'll discuss it in these terms here.
 
@@ -223,7 +221,7 @@ Scoping enables lazy loading. Import as vs. include at supports *Explicit Overri
 
 Dependencies between files must form a directed acyclic graph. However, each import or include is independent for gensym and Base, and it's awkward to maintain scattered references to content-addressed remotes. In most use cases, we'll share definitions through 'env.\*' instead of loading a module twice.
 
-Although it would not be difficult to support 'private' definitions per module (via gensym), doing so would harm extensibility and complicate intuitions of 'include'. We'll just use a convention like Python's `"_name"` at the module level and rely on *Explicit Override* to warn of issues (and content-addressed remotes, too).
+*Note:* We also forbid files and subfolders whose names start with ".". These are reserving for external tooling.
 
 ### Configuration
 
@@ -250,17 +248,29 @@ The assembler receives command-line arguments that express an assembly module as
 
 Aside from 'args', the assembly module is implicitly parameterized by the configured 'env'. The assembly module shall define 'result', representing the assembled product, i.e. a binary or folder.
 
-### Scripts
+### Computed Modules
 
-In some cases, it is convenient to just compute some text then interpret it as an include or import with a specified file extension. We already do this when specifying an *Assembly*. We can easily support it as a special case for import and include within a module, too.
+In some cases, it is convenient to compute some text then interpret it as an include or import with a specified file extension. We already do this via '-s' when specifying an assembly. We can easily support scripts as a special case for import or include within a module, too.
 
 ### Remotes
 
 The assembler will support content-addressed remote folders or files. The source is uniquely identified and authenticated by secure hash of content or DVCS revision. However, remotes are not *located* by secure hash. The developer may supply a list of locations to search. The user configuration may rewrite this list to suggest alternatives, adjust priorities, etc..
 
-For DVCS, we also name a tag or branch. Not to replace the hash, but to reduce network traffic, e.g. `"git clone -b Branch --single-branch URL"`. If the branch has updated, we can may force to an earlier revision but also warn that the remote has been updated so users may update.
+For DVCS, we also specify a tag or branch. Not to replace the hash, but to reduce network traffic, e.g. `"git clone -b Branch --single-branch URL"`. If the branch has updated, we can may force to an earlier revision but also warn that the remote has been updated so users may update.
 
 I intend to start with support for 'git'. Perhaps add mercurial and darcs later. It is feasible to hash individual files and access them via HTTP (like the dhall configuration language), but my intuition is that DVCS offers the superior maintenance experience.
+
+### Access Control
+
+Idiomatically:
+
+        import ... as libfoo
+        env.foo = libfoo.api if defined, else libfoo
+        bar = ... env.foo.xyzzy ...
+
+Modules don't have *export control*, per se. To support intuitions for 'include', and to maximize opportunity for extension and override, there are no 'private' definitions. But we do control the 'env.\*' environment available to imports. As a simple idiom, modules may define a dictionary 'api.\*' as a public API, then distribute only public definitions where feasible.
+
+*Note:* The assembler may know of this idiom and warn whenever it discovers a module that defines an unused, public 'api'.
 
 ## Assembler
 
@@ -468,43 +478,17 @@ Instead of machine-code mnemonics being something an assembler *interprets*, we 
 
 - write some binary data to intermediate staging location
 - maintain an abstract representation of program state
+- declare ad hoc external structure (.text, .data, .rodata)
+  - i.e. so we can deref 'structures' instead of 'pointers'
 
-Instead of explicit layout of all .text, .data, and .rodata elements, it is feasible to support content-addressed declarative layout. For precise control of layout, then, we can support some additional declarations per allocation.
+Ideally, there is no need to forward-declare labels for jumps, leveraging monadic fixpoint and staging to defer the pointer. Ideally, we can also support declarative allocations for static data, stack, and heap, i.e. where the amount allocated depends on future *assumptions* about which fields are present.
+
+*Aside:* Monadic expression is generally more robust and compositional than macros, yet similarly expressive. We are able to define higher-level mneumonics that are inlined.
 
 ## Standard Syntax
 
-An important design constraint (in my heart) is that assembly code must look and feel like assembly. I cannot afford much clutter, e.g. for preconditions and postconditions and other annotations. Any metaprogramming must fit nicely into assembly descriptions.
-
-Fortunately, I think Haskell's do/mdo notation is a decent fit for assembly. Labels need some attention, though.
+This section proposes an initial syntax for ".g" files. It should look and feel like assembly proramming in many cases, and favor vertical structure over deep indentations. Associative structure needs special attention because it enables future operations to influence how much is allocated.
 
 
-# OLD CONTENT
 
-## Syntax Ideas 
-
-### User Data
-
-I hope to develop a lightweight syntax for users to define data constructors, leveraging unique symbols for pattern matching and sealing. We can leverage smart constructors, active patterns, and type annotations.
-
-## Assembly Ideas
-
-### Content-Addressed Memory
-
-Instead of manually managing layout, it is feasible to 'jump' to code or 'load' data and have these converted later to memory addresses based on content and metadata. For mutable targets ('.bss' or '.data') we can include a symbol in metadata to distinguish multiple instances.
-
-This design significantly simplifies metaprogramming: we can allocate resources and computed subroutines as needed without predicting them in advance. To restore control over memory layout, an assembly may define interfaces to guide layout based on provided metadata.
-
-If writing out assembly mnemonics is modeled effectfully, we can feasibly capture the data and integrate the final location after we've collected all the data.
-
-### Local Labels
-
-Content-addressed memory doesn't work for local labels used in branches and jumps. But we still cannot assume the label target is defined before it is used, i.e. we can jump to something later within the assembly program.
-
-Labels may need specialized syntax within an assembly definition.
-
-### Structured Stacks
-
-Although we can directly manipulate the stack pointer, it would be convenient if we can automatically allocate stack locations based on usage, similar to how we allocate '.bss' sections. This seems feasible if we automatically accumulate sizes for referenced stack data elements.
-
-*TBD:* Generalize so we can leverage yet again for associative heap allocations.
 
