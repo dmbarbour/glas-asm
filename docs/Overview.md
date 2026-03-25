@@ -43,7 +43,7 @@ I propose to build upon a pure, untyped lambda calculus with lazy evaluation, ex
 - Monadic effects, via [Free-er Monads, More Extensible Effects](https://okmij.org/ftp/Haskell/extensible/more.pdf).
 - Inheritance, adapting [Prototypes: Object-Orientation, Functionally](http://fare.tunes.org/files/cs/poof.pdf).
 
-Users never touch the raw lambdas. Instead, we Scott encode a tagged union to distinguish numbers, lists, symbols, dictionaries, functions, objects, etc.. This supports ad hoc polymorphism similar to dynamic types.
+Users never touch the raw lambdas. Instead, we Scott encode a tagged union to distinguish numbers, lists, symbols, dictionaries, and functions. User-defined types are generally modeled as singleton dictionaries with symbolic keys. This supports ad hoc polymorphism similar to dynamic types.
 
 The extensions are more structural than semantic:
 
@@ -65,12 +65,13 @@ Aside from these patterns, it is feasible to support annotation-guided just-in-t
 
 ## Data
 
-The basic data types are numbers, lists, symbols, and dicts. Data is immutable, i.e. to 'update' a dictionary returns a new dictionary with the update applied. This can be efficient due to structure sharing and clever encodings under the hood.
+The basic data types are numbers, lists, symbols, dicts, and functions. Data is immutable, i.e. to 'update' a dictionary returns a new dictionary with the update applied. This can be efficient due to structure sharing and clever encodings under the hood.
 
 - Numbers include bignum integers and rationals, without implicit overflows or loss of precision. Exact arithmetic becomes intractable within a loop, and users may need to round numbers. (For high-performance number crunching, we'll rely on *acceleration*.)
 - Lists are used for all sequential structures. Large lists are represented by finger-tree ropes under the hood to efficiently support most operations. Binaries are lists of small integers (0..255) and optimized very heavily.
-- Symbols are abstract data that support only equality comparisons. Symbols can be constructed in two ways: modules may declare guaranteed-unique symbols when imported, and any composition of basic data may be abstracted as a symbol.
+- Symbols are abstract data that support only equality comparisons. Symbols can be constructed in two ways: modules may define guaranteed-unique symbols when imported, and composition of data *excluding* functions may be abstracted as a symbol.
 - Dictionaries are finite key-value lookups where the keys are transitively composed of basic data. Tagged unions are modeled as singleton dictionaries. Dictionaries do not support iteration over keys containing symbols, a simple basis for data abstraction.
+- Functions are, essentially, dynamically computed key-value lookups. Some computations may diverge. We cannot observe whether two functions are equal, but we can assert they are (via annotation).
 
 User-defined data types will mostly be modeled as tagged unions with declared unique symbols. By hiding the symbol, this effectively serves an abstract data type, enabling the module to control construction and observation.
 
@@ -83,37 +84,35 @@ Pure functions can model stateless objects in terms of open recursion via latent
         fix f = let x = f x in x     -- lazy fixpoint
         new spec env = fix (spec env)
 
-Most observations on Base or Self prior to instantiation will either diverge on fixpoint or compromise extensibility. Although fixpoint divergence is easy to detect and debug, the opportunity cost to extensibility is invisible and awkward to explain. It's best to ensure syntax avoids potential pitfalls.
+Most observations on Base or Self prior to instantiation either diverge on fixpoint or compromise extensibility. Although fixpoint divergence is easy to detect and debug, an opportunity cost to extensibility is invisible and awkward to explain. So, it's best to design a syntax for constructing objects that avoids the pitfalls.
 
-Inheritance and override is a useful mechanism for extensibility. For example, we can model a grammar as an object where the methods represent parser combinators, then extend the integer parser. In context of binary specification, available overrides will likely be less structured, more organic, but still useful.
-
-Note that implementation inheritance is the focus, not subtyping or substitutability. Extensibility is producing useful variations of a system without invasive edits. But useful variation doesn't imply monotonic updates. For example, it might be useful to disable a parse rule to restrict a language.
-
-*Aside:* I'll call 'specification' or 'spec' what most OO languages call 'class'. I feel specification has cleaner connotations, notably avoiding connotations of subtyping. 
+A use case for objects is extensibility in context of mutually recursive definitions. For example, a stateless object may model a grammar. Methods, as dict values, may represent parser combinators for different cases (parsing integers, for example). The ability to update (extend, disable, etc.) a parse rule without rebuilding the entire grammar is convenient when developing variations on a language.
 
 ### Explicit Override
 
 To resist accidents, it's useful to syntactically distinguish between introducing a name and overriding a name. Doesn't need to be much, e.g. `=` vs. `:=` is probably sufficient. Will figure this out when I start detailing syntax.
 
-### Multiple Inheritance
+### Stateful Specification
 
-Multiple inheritance is convenient when composing systems that build upon common foundations or frameworks. Given `C:A,B` and `A:F`, `B:F`, where F is the shared framework and C is the composition, we want a final mixin order `C,A,B,F`. Relevantly, F is not duplicated and appears *after* both A and B, ensuring consistent order, though A's view of F is now influenced by B. 
+Mixins can easily model state-like operations, e.g. increment a 'counter' in Base while capturing the prior value.
 
-Multiple inheritance is implemented by reifying dependencies then applying a linearization algorithm such as C3. Of course, lambdas are incomparable. And we probably shouldn't compare objects based on shared behavior regardless - it's 'purpose' we want to avoid duplicating. To support linearization, we'll pair functions with tags as proxy to purpose. 
+        λBase. λSelf. Base with { 
+            myid = Base.idct, 
+            idct = 1 + Base.idct 
+        }
 
-By default, we'll implicitly declare a globally unique symbol to tag every syntactically-defined object. This probably covers 99.9% of use cases. We can let users explicitly provide a symbolic tag to cover the exceptions.
+In this case, the final 'Self.idct' would be the number of identifiers allocated. This pattern easily extends to building tables and other structures. However, it does take some discipline to use correctly when expressed directly in lambda calculus. This could be mitigated by something like writing object definitions within a 'staged state' monad.
 
-Tags don't need to be globally unique but must not be reused in scope of linearization. To express and verify this local-uniqueness assumptions, we can introduce annotations for asserting incomparable values are equivalent. Although the assembler cannot prove equivalence of functions in general, it at least can warn when not obviously equivalent (i.e. referentially or structurally), or raise an error if obviously not equivalent. 
+### Extended Objects
 
-### Symbolic Method Names
+We'll use basic objects at the module scope, i.e. modules as mixins. But we'll probably want a few more features for modeling objects in the general use case. Potential extensions:
 
-Using short strings as method names, especially generic and context-dependent names like "map" or "draw", easily leads to ambiguities and collisions, especially in context of multiple inheritance or dynamic mixins. There are other weaknesses: no clear mechanism for private names, no feedback on deprecating names.
+* *multiple inheritance* - Wrap basic mixins with tags, inheritance lists, and linearization algorithms. Linearization algorithm asserts that mixins with the same tag are equivalent, eliminates redundancy, and ensures a consistent merge order for shared mixins. 
+  - A front-end compiler can assign a unique symbol as the default tag.
+* *lazy instantiation* - Because objects are stateless, there is no need to instantiate more than once. Alongside those inheritance lists, we may include a lazy instantiation of the object's definition.
+* *access control and interfaces* - Symbolic keys cannot be iterated. Thus, we can use symbolic keys to control access and override for subsets of methods. It is syntactically awkward to use symbols per method, but per declared interface seems feasible.
 
-A robust alternative is symbolic names. Modules may generate unforgeable symbols upon import, then export them. By using symbols as method names, we eliminate ambiguity and we gain object-capability security for individual methods, a secure yet flexible basis for privacy.
-
-At external tooling boundaries, e.g. log message objects or language objects for user-defined syntax, it is awkward to reference names through the module system. In these cases, we can still construct unambiguous symbols based on DNS, e.g `symbol("glam-lang.org/2026/log/text")`.
-
-At the module layer, we're effectively stuck with short strings: they're necessary for concise syntax! But modules are constrained in other ways that mitigate concerns of collision: no multiple inheritance, static mixins only (via include), and *explicit override* still applies.
+Ideally, we can provide a syntactic sugar that makes extended objects convenient to work with, but enabling users to explore alternative object models and further extensions.
 
 ## Effects
 
@@ -140,7 +139,7 @@ We can specialize the monadic operators for our only monad. Our untyped lambda c
         (Return a) >>= k = k a
         k1 >>> k2 = (>>= k2) . k1
 
-Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. To resolve this, we could lift into semantics (change Yield continuation to a queue), or insist on a built-in optimization (similar reasoning as tail-call optimization). I favor the latter.
+Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition `>>>` is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. To resolve this, we could lift into semantics (change Yield continuation to a queue), or insist on an accelerator or built-in optimization (similar to tail-call optimization). I favor the latter.
 
 Behavior is embodied in the runners aka handlers. It is convenient to express 'stacks' of partial handlers for local subtasks that forward unrecognized requests. Basically, any effect can be encoded except race conditions (outcome is deterministic). I wrote a few examples to help myself grasp this: 
 
@@ -205,23 +204,21 @@ Threaded effects involve running multiple monadic threads. Like runThreadT but w
 
 These techniques work well together, e.g. we can buffer asynchronous requests locally per thread, then yield heuristically (to flush the buffer) or when an external response is needed. The main benefit of buffering would be doing more work per step, which is mostly useful in context of spark-based parallelism.
 
-## Modularity
+## Modules
 
-A module is represented by a file. Modules may reference other files within the same folder or subfolders, or a content-addressed remote. We forbid Parent-relative ("../") and absolute filepaths. These constraints ensure folders are location-independent and temporally stable, yet editable by conventional means. 
+A module is *represented by* a file, and *represents* a basic mixin object.
 
-Modules are modeled as mixins objects with limited effects during construction, conceptually `Dict -> Dict -> Eff {load | gensym} Dict` (in roles `Base -> Self -> Instance`). The module type is fully abstracted (see *User-Defined Syntax*). But we'll discuss it in these terms here.
+To simplify architecture, file dependencies are constrained: a file may reference only local files within the same folder or subfolders (no parent-relative ("../") or absolute paths), or content-addressed remote files (by DVCS revision hash and filename). It's an error to load files or subfolders twice. To simplify tooling, local files and subfolders whose names start with "." are hidden from the module system.
 
-A few mechanisms to integrate loaded modules:
+The assembler provides a built-in front-end compiler for ".g" files. However, the module system supports *User-Defined Syntax* aligned to file extensions, detailed later. The front-end compiler constructs a basic mixin object, i.e. `Dict -> Dict -> Dict` in roles `Base -> Self -> Instance` without multiple inheritance (see *Objects*). Front-end compilers logically support unique symbol generation via *Stateful Specification* of objects.
 
-* *include* - bind included module's Base to host's current Base, treating prior definitions as mixins. Share Self. Effectively applies a module as a mixin. Adds arbitrary names to namespace.
-  * *include at* - scoped includes; applies to dictionary defined wihin Base instead of directly to Base.
-* *import as* - introduces a dictionary with `{ "env": Self.env }` (by default) then translate include to this dictionary. 
+Every module-level definition is modeled as a mixin. A module is integrated by 'including' it as another mixin. But there are a few forms:
 
-Scoping enables lazy loading. Import as vs. include at supports *Explicit Override*. Note that we do not instantiate anything: there is only one Self for an entire configuration or assembly. This maximizes extensibility, ensuring we can override names defined deeply within imported modules. 
+* *include Module* - bind included module's Base to host's current Base namespace, sharing Self.
+* *include Module at m* - translate inclusion to a component dictionary 'm', i.e. included module Base links to host's Base.m, and the included module's Self is linked to the host's Self.m. 
+* *import Module as m* - useful sugar: introduces 'm' with `{ "env": Self.env }` (by default), then applies 'include Module at m'.
 
-Dependencies between files must form a directed acyclic graph. However, each import or include is independent for gensym and Base, and it's awkward to maintain scattered references to content-addressed remotes. In most use cases, we'll share definitions through 'env.\*' instead of loading a module twice.
-
-*Note:* We also forbid files and subfolders whose names start with ".". These are reserving for external tooling.
+The 'include at' and 'import as' forms are useful for lazy loading and access control. In the end, there is only one 'Self' for the entire system. This simplifies deep overrides across component dictionaries, and also directly overriding the dictionaries.
 
 ### Configuration
 
@@ -229,36 +226,40 @@ The assembler implicitly loads a configuration module based on the `GLAM_CONF` e
 
 The configuration serves several roles:
 
-- *Assembly environment*: define 'env'. This is passed to the assembly as if importing the assembly into the configuration, e.g. `{ "env": Config.env }`. This environment is analogous to system includes and shared libraries, supporting adaptive assembly. 
+- *Assembly environment*: define 'env'. This is passed to the assembly as if importing the assembly into the configuration, e.g. `{ "env": Config.env }`. This environment can provide default target information, system includes and shared libraries, etc. for adaptation.
 - *Command-line macros*: if the first command-line argument to the assembler does not start with '-', we apply 'cli', which should be a function of type `List of String -> List of String` that returns valid arguments or empty list.
 - *Development environment*: Define a loop for '-i' interactive mode. Filter outputs to standard error if non-interactive.
 - *Resource management*: ad hoc, e.g. specify GPGPUs available for acceleration, cache locations and replacement heuristcs, history management, shared proxy compilation and cache, search locations for content-addressed remotes, tune assembler JIT or GC heuristics, control expensive tests and checks (e.g. assertions, fuzzing).
 
 Configurations never directly control assembler output: An assembly may ignore your configured environment and substitute its own. Command-line macros may always be written out long form. Resources influence performance and error detection but not a valid binary result.
 
-To support project-specific overrides or sharing of a system configuration, `GLAM_CONF` is not limited to one file. Users may list multiple files (same OS-specific separator as the `PATH` variable). We apply these as mixins, each file overriding those listed later.
+To support project-specific overrides or sharing of a system configuration, `GLAM_CONF` may list multiple files (same OS-specific separator as the `PATH` variable). We apply these as mixins, each file overriding those listed later.
 
 ### Assembly
 
 The assembler receives command-line arguments that express an assembly module as a list of mixins. Though, in practice, it's usually just one file or script. Relevant arguments:
 
-- `(-f|--file) FileName` - list a file to include; first file is included last, overriding those listed later. Depending on the configured environment, assembly files aren't limited to ".g" (see *User-Defined Syntax*).
+- `(-f|--file) FileName` - list a file to include; first file is included last, overriding those listed later. Depending on the configured environment, assembly isn't limited to ".g" files (see *User-Defined Syntax*).
 - `(-s|--script).FileExt Text` - behaves as a remote file with the given file extension and text. Scripts cannot import local files.
 - `-- List Of Args` - assembler defines 'args' before including files or scripts. Default is empty list, but caller may override with elements following the '--' separator.
 
 Aside from 'args', the assembly module is implicitly parameterized by the configured 'env'. The assembly module shall define 'result', representing the assembled product, i.e. a binary or folder.
 
-### Computed Modules
-
-In some cases, it is convenient to compute some text then interpret it as an include or import with a specified file extension. We already do this via '-s' when specifying an assembly. We can easily support scripts as a special case for import or include within a module, too.
-
 ### Remotes
 
-The assembler will support content-addressed remote folders or files. The source is uniquely identified and authenticated by secure hash of content or DVCS revision. However, remotes are not *located* by secure hash. The developer may supply a list of locations to search. The user configuration may rewrite this list to suggest alternatives, adjust priorities, etc..
+Remote files are content-addressed, typically at DVCS scope. This might be expressed as a dict or object with:
 
-For DVCS, we also specify a tag or branch. Not to replace the hash, but to reduce network traffic, e.g. `"git clone -b Branch --single-branch URL"`. If the branch has updated, we can may force to an earlier revision but also warn that the remote has been updated so users may update.
+- DVCS protocol (git, hg, darcs)
+- DVCS repo revision hash
+- filename within repo
+- list of repo URLs (backups!)
+- tag or branch name(s)
 
-I intend to start with support for 'git'. Perhaps add mercurial and darcs later. It is feasible to hash individual files and access them via HTTP (like the dhall configuration language), but my intuition is that DVCS offers the superior maintenance experience.
+The file is uniquely identified and authenticated by revision hash and filename. The repo URLs support multiple backup search locations; this list may be rewritten by the user configuration. A tag or branch name is used only as a hint for efficient download, such as: `git clone -b Branch --single-branch URL`.
+
+Syntactically, remote files are awkward. They are not concise, and maintenance of revision hashes scattered or duplicated across multiple files is a hassle. The latter can be mitigated by centralizing remotes per repo or project. Regarding concision, I'll need a presentable multi-line import syntax, separate definition of locations, or both.
+
+*Aside:* We aren't restricted to DVCS. Viable alternatives include download of secure-hashed zipfiles, or even individual source files. But my intuition is that DVCS will offer the best development and maintenance experience for content-addressed structure.
 
 ### Access Control
 
@@ -349,27 +350,19 @@ In practice, this may require copying local files and maintaining a local DVCS r
 
 ## User-Defined Syntax
 
-User-defined syntax is a convenient approach to external DSLs and metaprogramming, and provides an opportunity for graphical programming.
+When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` should evaluate to an object or dict that defines 'compile'. This object may also define auxilliary methods for tooling or the interaction loop, e.g. syntax highlighting or a specialized language-server protocol. To normalize FileExt, we lower-case 'A-Z' and strip initial '.'. In case of ".g" files, the assembler provides a built-in as a fallback, but we favor a user-defined compiler.
 
-When loading a module, a front-end compiler is selected from the provided environment based on file extension, i.e. `Base.env.lang.[FileExt]` should evaluate to a language object that defines 'compile'. This is also the case for "g" files, but in that special case the assembler provides a built-in as a fallback. The only file that must be "g" is the user configuration.
+The 'compile' method is expressed effectfully, as a parser combinator. The effects are carefully designed to simplify tracing of errors back to sources, isolate parse errors, support edit suggestions.
 
-A significant design challenge for user-defined syntax is integration with a development environment: tracing bugs, isolating syntax errors, visualization and editable projections, index and search, autocomplete, autoformat, etc.. The conventional solution is to develop a suite of external tools, IDE plugins, etc. for each syntax. The language object serves is intended to serve this role: aside from 'compile' it may define methods for tooling, e.g. a language-server protocol.
-
-But the conventional solution is not very well integrated. It involves a lot of rework, and is fragile to changes in syntax. I hope we can do better by integrating features into the compiler.
-
-Some design thoughts:
-
-- Parser combinators are a great starting point. Parser combinators can implicitly track parse locations and describe what they 'expect' to see at any given step, providing effective feedback in case of syntax errors.
-- To simplify tracing, blame, error isolation, etc. the compiler must avoid directly observing parse results. Even parse errors must be abstracted To enforce this, we can return abstract data from parse operations by default. This might be expressed as an applicative functor. We can also provide built-in combinators for common loop structures.
+- Parser combinators are a great starting point. Parser combinators can implicitly track parse locations and describe what they 'expect' to see at any given step, providing effective feedback in case of syntax errors and metadata for tracing.
+- To simplify tracing, blame, error isolation, etc. the compiler must avoid directly observing parse results. Even parse errors must be abstracted. To enforce this, we return abstract data from parse operations by default, perhaps expressed via applicative functor. We must provide built-in combinators for optionals and loops.
+- In context of error isolation, we cannot model monadic 'state' at compile time in general, but we could support a few special cases where state is easily 'forked' for parsing subcomponents, especially gensym: abstract, unique, unforgeable symbol generation.
+- We can feasibly support something like a 'writer' monad for tests, illustrations, editable projections, indexes, etc.. However, if we hope to preserve lazy loading, we must be careful about automatic composition of indices. Use of annotations may mitigate this.
 - To support syntax-driven effects without observing the syntax, we can introduce an eval effect that lifts a user expression into the front-end compiler. The result of eval is then abstracted. This effectively supports some forms of macros.
-- It is useful to support multi-pass parses. For example, a first pass might delimit the 'region' for another pass. Even if we drop the first pass result, this can be very useful for error isolation. 
-- Aside from source locations, the front-end compiler should be able to inject additional annotations on abstract nodes to support validation, visualization, editable projections, indexing, etc.. 
-- Using gensym, we can generate a unique abstract data type for the applicative per file. This is useful to control staging, i.e. it is useless to hold onto the abstract data.
-- Users should never directly see module Base or Self. We should restrict module-level names to strings. This simplifies translation for 'include at'. We can simultaneously restrict object-level names to symbols.
+- It is useful to support multi-pass parses. For example, a first pass might delimit the 'region' for another pass. Even if we drop the first pass result, this can be useful for error isolation.
+- Compiler keeps module dictionaries (Base, Self) abstract, user only accesses them indirectly. This simplifies monadic tracking of dependencies.
 
 Expressing a compiler without being able to 'see' the binary seems possible in theory, but I'm not entirely convinced that we won't reintroduce the tracing problem via Eval. To gain confidence, I must try it first with the standard syntax. After all, we should be able to override and extend the standard syntax, too. Worst case, I'm back to the conventional approach.
-
-*Note:* We'll convert FileExt ASCII characters to lower-case and strip an initial '.', but otherwise it's just taken as a string. 
 
 ### Syntactic Bootstraps
 
@@ -383,19 +376,17 @@ If the final `Self.env.lang.[FileExt].compile` method is different from the Base
             if(compiler == compiler') then m else
             bootstrap(ext, args, compiler')
 
-The built-in compiler is simply treated as one more compiler in the bootstrap cycle, equivalent to itself. A module may simply delete a provided "g" implementation to avoid user-defined feature extensions. In practice, syntax bootstrapping should be relatively rare: it's expensive and easily goes wrong. 
-
-But it has some use cases. Mostly, adding features to the primary ".g" language and shifting dependencies from assembler version to module system.
+A built-in compiler is simply treated as one more compiler in the bootstrap cycle, equivalent only to itself. 
 
 ### Editable Projections
 
 Some user-defined syntax may be graphical. And even for purely textual syntax, we'll often want to integrate some visualizations or provide edit widgets like color pickers. Miscellaneous observations:
 
-- We can only edit terms annotated with source locations, parser context, and an encoder that converts the parse result back into source (aka lenses or prisms). 
+- We can only edit terms annotated with source locations, parser context, and an encoder that converts the parse result back into source (aka lenses or prisms). We can verify any edits for round-trip between parse and encode.
 - Some content is naturally read-only, e.g. content-addressed remote files, read-only local files. In these cases, we can still support navigation, views, etc.. and partially-editable views are feasible.
-- Editable views benefit from some reflection, e.g. support indices and aggregated views across multiple files.
-- It is convenient to treat a file that does not exist as equivalent to an empty file for purpose of imports. This way, an import reference obtains a hyperlink and projectional editor.
-- I'll want to flexibly mix editable views with rendering test results, providing a round-trip between updates and outcomes. Interactions for filtering or progressive disclosure of tests should be possible.
+- Support for navigation, progressive disclosure, etc. benefits from user-local or session state. 
+- It is convenient to treat a file that does not exist as equivalent to an empty file for purpose of imports and projections.
+- Ideally, we can obtain immediate feedback on edits by visualization of tests. This may require some integration of projections and tests.
 
 TBD: This is non-trivial, and I don't have a solid handle on exactly how to approach it.
 
@@ -403,50 +394,56 @@ TBD: This is non-trivial, and I don't have a solid handle on exactly how to appr
 
 What can we feasibly implement to support developers in reasoning about the assembly process and product?
 
-* *Testing*: Sample system behavior under various conditions, make pass/fail judgements. We should be able to visualize tests in tables and graphs, and the test process in many cases. Should support fuzzing, heuristic exploration of conditions, parallelism, and incremental computing.
+* *Types*: We can annotate assumptions about programs and data in a composable, machine-checkable way. It is feasible to reason about an executable binary's runtime behavior insofar as it is encoded into types. We may leverage 'type interpreter' functions that compute type annotations from data or AST embeddings, similar to GADTs. In context of gradual or partial type annotations, we must assume not every term is typed, and the assembler makes a best effort to prove or disprove types.
 
-* *Visualization*: Start with logging and profiling, but extend to graphical views, interactions for progressive disclosure or search, etc.. I propose to model log messages as mixins implementing multiple views. Plain text is one view, but we can feasibly render icons, interactive widgets, etc..
+* *Tests*: We can sample subprogram behavior under various conditions. With acceleration, it is feasible to emulate execution of machine code. Tests should support heuristic, non-deterministic choice to include fuzzing and property checking and race conditions, enabling the assembler to heuristically choose tests from a vast space for maximal branch coverage. Tests should be a convenient foundation for visualization of program behavior.
+
+* *Contracts*: Contracts might describe a monadic subprogram's preconditions, postconditions, and invariant assumptions in a locally testable way, perhaps via assertions. A relevant challenge is how to effectively use contracts in context of staged metaprogramming of an executable binary.
+
+* *Theorems*: The main difference between a theorem and a test is a 'forall' or 'there exists', and the need for abstract interpretation to support the proof. In practice, we may need explicit proofs or proof-hints to efficiently verify theorems. 
+
+* *Visualization*: Start with logging and profiling, extend to graphical views of tests, progressive disclosure or search, etc.. I propose to model log messages as dicts or objects implementing multiple views. Plain text is one view, but we can feasibly render icons, interactive widgets, etc..
 
 * *Tracing*: Maintain metadata to trace outcomes (errors, data, etc.) back to contributing sources. There's a tradeoff between precision and performance. We can feasibly leverage reproducibility by replaying a computation under a few different tracer setups to obtain more precision.
 
-* *Types*: We can annotate our assumptions about data and programs in a machine-checkable way. The assembler makes a best effort to prove or disprove types, possibly using dynamic checks. Unfortunately, gradual typing won't be very effective for sophisticated uses (phantom types, substructural types, etc.).
-
-* *Abstract Interpretation*: Given a representation of a program (e.g. machine code) we can implement an 'interpreter' using variables instead of data. Users add their own assumptions about this interpretation, then we check for conflicts. Essentially, we can mechanically implement a type system scoped to our target.
+* *Abstract Interpretation*: Given a representation of a program (e.g. machine code) we can implement an 'interpreter' using variables instead of data. Users add their own assumptions about this interpretation, then we check for conflicts. Essentially, we can mechanically implement a type system scoped to our target. Can feasibly integrate types via 'type interpreter' functions, and tests via constraint systems.
 
 I envision use of type annotations to catch obvious errors in the assembly process, abstract interpretation as our primary means to reason about the product, and testing in a more ad hoc role. Visualization should build on tests and integrate nicely with a projectional editor.
 
 ### Integration
 
-An relevant concern is how automated reasoning interacts with extension, especially extensions that represent breaking changes. 
+Some extensions are non-monotonic and may 'break' prior assumptions. Ideally, the same extensions that break assumptions can repair them. Extensions are aligned with the namespace via modeling modules as mixins. Thus, we should align types, tests, contracts, visualizations, etc. with the namespace. Further, in context of lazy loading and shared environments, we'll also want to evaluate only 'relevant' reasoning.
 
-Ideally, extensions have an opportunity to both suppress expected errors and 'fix' them by updating assumptions. Extensions are aligned with the namespace. This suggest it's best to align types, tests, visualizations, etc. with the namespace where feasible. The structure of this alignment is flexible, so long as it admits erasure and override.
+In context of these forces, it seems types, tests, contracts, etc. should bind to definitions. It makes sense to name individual tests or contracts for both error reporting and fine-grained overrides, and it might prove useful to name 'overlays' for types, too.
 
-There are use cases for embedded type annotations and assertions. These anonymous structures can be 'fixed' only by updating the host function. Arguably, that is exactly what should occur: when used correctly, an embedded annotation is like a fuse in a system that says 'break here if this assumption changes', and should be written to be as weak as possible.
-
-Embedded annotations will inevitably be used incorrectly. But worst case isn't too bad, e.g. override a few definitions or fork a library to weaken unnecessarily tight constraints. Maybe communicate a little (issue reports, pull requests).
-
-Overall conclusion here: no new constraints, but enable and encourage 'named' tests, types, visualizations, etc..
+We can feasibly integrate reasoning within extended user-defined objects, not just the module layer, insofar as those objects are specified in the module layer (instead of buried within another function). Ideally, the monad for user-defined syntax supports flexible bindings while structurally guaranteeing relationships to the namespace.
 
 ### Tests
 
-Requirements for tests:
+Testing samples behavior under a range of conditions. In context of fuzz testing and property testing, it is convenient to blur the lines between tests and theorems, enabling the assembler to make heuristic decisions about about what to test to maximize branch coverage.
 
-- non-deterministic choice to support fuzz testing, simulate race conditions, etc..
-  - both discrete and continuous, e.g. integers and rationals
-  - assembler may use abstract interpretation to guide choice 
-- status for test parameters and outcomes, a record we can graph, visualize, animate
-- log outputs, not just as annotations but as something we can place on test timeline
-- return a pass/fail judgement
+Useful properties:
 
-Monadic expression of tests is well-aligned to these goals. However, users cannot implement handlers for non-deterministic choice or abstract interpretations. Testing will require assembler support. The assembler may heuristically or configurably cache tests to reduce rework and support regression testion. This involves capturing a continuation and sequence of non-deterministic choices (or ranges of choices). For long-running tests, the assembler can also maintain intermediate checkpoints for efficient replay.
+- constraint system, derive test parameters from assumed conditions
+  - abstract simulation of environment, e.g. race conditions
+- non-deterministic choice to *sample* test parameters, environment
+  - both discrete and continuous, i.e. integers and rationals
+  - assembler may use abstract interpretation to defer choice 
+- status and state, something we can visualize and animate
+  - bind to constraint system, use temporal logic for state?
+- returns a pass/fail judgement
 
-In interactive mode, it is feasible to continue fuzzing indefinitely. On updates, some old tests may become 'stale' based on incremental computing. It might be useful to visualize stale tests together with new ones, perhaps distinguishing by color. In non-interactive mode, we'll want configurable, heuristic quotas for how much testing to perform.
+Monadic expression of tests seems well-aligned to these goals. Perhaps we express test parameters and expectations in context of the constraint model, then sample constraints as a non-deterministic choice. An assembler can feasibly perform whole-volume tests in some cases, but with tests we don't necessarily insist on a full proof.
+
+The assembler may perform tests randomly, but is expected to perform them heuristically. Of course, early heuristics might not be very good. Users are free to favor deterministic testing in these cases. The assembler may cache tests for regression testing, may save checkpoints to simplify replay of discovered errors, and can potentially support work sharing for tests between users via shared cache.
+
+In interactive mode, it is feasible to fuzz test indefinitely. On updates, some old tests may become 'stale' based on incremental computing. It might be useful to visualize stale tests together with new ones, perhaps distinguishing by color. In non-interactive mode, we'll want configurable, heuristic quotas for how much testing to perform.
 
 ### Types
 
-The underlying lambda calculus is untyped, but we can express type annotations. I imagine type annotations will be incomplete, partial, gradual. The assembler makes a 'best effort' to either verify or contradict type annotations ahead of evaluation. If types are neither proven nor disproven, the assembler emits a warning. 
+The underlying lambda calculus is untyped, but we can express ad hoc type annotations. I imagine type annotations will be incomplete, partial, gradual. The assembler makes a 'best effort' to either verify or contradict type annotations ahead of evaluation. If types are neither proven nor disproven, the assembler emits a warning. 
 
-There are no 'dynamic' type checks during evaluation. Although feasible, dynamic typing has unpredictable performance implications and hinders type-level debugging. That said, dynamic checks may be useful for heuristically tracing blame.
+There are no 'dynamic' type checks during evaluation. Although feasible, dynamic typing has unpredictable performance implications and complicates type-level debugging. That said, dynamic checks may be useful for heuristically tracing blame.
 
 Under these constraints, what types can we express?
 
@@ -454,7 +451,7 @@ Under these constraints, what types can we express?
 - user-defined nominative types: via tagged unions with guaranteed-unique symbols. Ideally, we can express GADTs and dependent types, so we can express our assumptions even when we cannot fully check them.
 - substructural types and session types are feasible within limited scopes. Modeling them in effects handlers is probably the most relevant, e.g. to model channels typed with protocols. 
 
-We cannot directly express type-indexed behavior, i.e. no typeclasses, operator overloading, or multimethods. Annotations cannot influence outcomes. But it is feasible to ensure types are aligned with structure in some way to simulate type-indexed behavior.
+We cannot directly express type-indexed behavior because type inference at the annotation layer does not influence program behavior. Indirectly, we could ensure that types are aligned with observable structure, such as symbols, which can be used in dispatch. 
 
 *Note:* Type checking in context of gradual types remains vague to me. My intuition is that these should clear up a lot once we start defining a language of type descriptions.
 
@@ -462,15 +459,21 @@ We cannot directly express type-indexed behavior, i.e. no typeclasses, operator 
 
 Constraint systems are a convenient mechanism for abstract interpretation. We can feasibly accelerate constraint systems with cvc5, Z3, or other solvers. Unfortunately, the accelerator cannot observe the *solution* because it's effectively non-deterministic. But we can use the sat/unsat judgement.
 
-The DSL for constraints can be directly adapted from SMTLIB2. For variables, we can easily use `(Var symbol)` or similar, using a distinct symbol per variable. We easily can control naming conflicts between globally-unique symbols and constructed symbols with local naming strategies.
+The DSL for constraints can be adapted almost directly from SMTLIB2. For variables, we can easily use `(Var x)`, where 'x' may be any valid dictionary key. We easily can control naming conflicts via module-level gensym and local naming strategies.
 
-It is relatively convenient to build a constraint system statefully, within a monad, and perhaps occasionally 'Check' for sat/unsat. This is the approach I intend to pursue for assembly code.
+It is relatively convenient to build a constraint system statefully within a monad, and occasionally 'Check' for sat/unsat. We can align constraints with abstract interpretation.
 
-### Messages
+### Visualization
 
-I propose to model log messages as mixins. In the simplest case, a message defines 'text' for printing to a console. But we can feasibly extend the message with multiple views and metadata for search and filter. Mixins can easily express templated messages with good defaults. And the assembler may provide some reflection capabilities, access to locations, etc. as arguments to Base.
+A relevant question is how we express visualizations. Per *integration*, visualizations must align with definitions. We can feasibly support multiple visualizations per definition. But it will likely prove more convienient to bind visualizations to *types*. Then bind types to definitions. This simplifies expression, composition, and reuse of visualizations.
 
-Although messages are stateless, it seems useful to model session-local (or user-local) state for stateful views, such as progressive disclosure.
+To visualize a function, we can visualize the arguments and results and perhaps some intermediate representations during evaluation. In case of curried arguments, we'll want to tie invocations to both call site and origins of terms or definitions site, and support browsing from either location.
+
+Rendering should be extensible, e.g. support both 'text' console output and SVG. Some visualizations should be interactive, e.g. so we can rotate a 3D graph or apply progressive disclosure. We might model visualizations as dictionaries or objects that define recognized interfaces for common viewers.
+
+### (Tentative) Theorems and Proofs
+
+We might express theorems as tests with an explicit intention for exhaustive testing. We can feasibly annotate both theorems and tests with *proofs* to cover entire ranges more efficiently. The question, then, is what would a proof look like? Perhaps some hints for how to partition constraints, and strategies to skip concrete evaluation. I'll need to review what is feasible here.
 
 ## Assembly Programming
 
@@ -487,7 +490,7 @@ Ideally, there is no need to forward-declare labels for jumps, leveraging monadi
 
 ## Standard Syntax
 
-This section proposes an initial syntax for ".g" files. It should look and feel like assembly proramming in many cases, and favor vertical structure over deep indentations. Associative structure needs special attention because it enables future operations to influence how much is allocated.
+This section proposes an initial syntax for ".g" files. It should look and feel like assembly proramming in many cases, and favor vertical structure over deep indentation. Associative structure needs special attention because it enables future operations to influence how much is allocated.
 
 
 
