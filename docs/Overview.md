@@ -81,7 +81,7 @@ Pure functions can model stateless objects in terms of open recursion via latent
 
         mix child parent = λbase. λself.
            (child (parent base self) self)
-        fix f = let x = f x in x     -- lazy fixpoint
+        fix f = let x = f x in x        -- lazy fixpoint
         new spec env = fix (spec env)
 
 Most observations on Base or Self prior to instantiation either diverge on fixpoint or compromise extensibility. Although fixpoint divergence is easy to detect and debug, an opportunity cost to extensibility is invisible and awkward to explain. So, it's best to design a syntax for constructing objects that avoids the pitfalls.
@@ -122,7 +122,7 @@ Even without a runtime, effects are convenient for implicit dataflow, backtracki
             | Yield (rq x) (x -> Eff rq a)
             | Return a
 
-We can model a free-er effects monads as either *yielding* a `(request, continuation)` pair or *returning* a final answer. In case of yield, the continuation expects the response type from the request. Of course, in context of untyped lambda calculus and gradual type annotations, enforcement may be a bit shoddy.
+We can model a free-er effects monads as either *yielding* a request, continuation pair or *returning* a final result. In case of yield, the expected response type depends on the request. Of course, in context of untyped lambda calculus, enforcement may be limited.
 
 We can easily introduce some syntactic sugar:
 
@@ -131,48 +131,45 @@ We can easily introduce some syntactic sugar:
         op2             op2 >>
         op3 a           op3 a
 
-*Note:* Haskell also has a *RecursiveDo* sugar, enabling a result to be used before it is defined. I'm less familiar with this desugaring, but I'll surely want RecursiveDo by default. It seems convenient for branching to forward labels, for example. This has consequences for syntax: no shadowing names, because it would be unclear whether you're referring forwards or backwards.
-
 We can specialize the monadic operators for our only monad. Our untyped lambda calculus doesn't offer a direct solution to type-indexed behavior, such as typeclasses, so this is convenient:
 
-        (Yield rq k1) >>= k2 = (Yield rq (k1 >>> k2))
+        (Yield rq k1) >>= k2 = Yield rq (k1 >>> k2)
         (Return a) >>= k = k a
         k1 >>> k2 = (>>= k2) . k1
 
-Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition `>>>` is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. To resolve this, we could lift into semantics (change Yield continuation to a queue), or insist on an accelerator or built-in optimization (similar to tail-call optimization). I favor the latter.
+Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition `>>>` is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. Ideally, the assembler optimizes this, e.g. by acceleration of `>>>`. Tail-call optimization will also be desirable.
 
-Behavior is embodied in the runners aka handlers. It is convenient to express 'stacks' of partial handlers for local subtasks that forward unrecognized requests. Basically, any effect can be encoded except race conditions (outcome is deterministic). I wrote a few examples to help myself grasp this: 
+Behavior is embodied in the runner or handler. Almost any effect can be modeled, the main exception being race conditions. It is feasible to compose effects as a 'stack' of handlers. I wrote a few examples to help myself grasp this: 
 
-        -- generalize State to indexed, hierarchical Memory
+        -- generalize State to extensible, indexed Memory
         -- use guaranteed-unique symbols to avoid conflicts
         runMemT m (Yield (Mem idx op) k) = match idx with
-            Outer idx' -> Yield (Mem idx' op) (runMemT m . k)
-            _ -> match op with
-                Get -> runMemT m (k (m.[idx])) 
-                Put v -> runMemT (m with { .[idx] = v }) (k ())
-                Del -> runMemT (m without idx) (k ())
-        runMemT m (Yield rq k) = Yield rq (runMemT m . k)
+            match op with
+              Get -> runMemT m (k (m.[idx])) 
+              Put v -> runMemT (m with { .[idx] = v }) (k ())
+              Del -> runMemT (m without idx) (k ())
+        runMemT m (Yield (Lift rq) k) = Yield rq (runMemT m . k)
         runMemT m (Return r) = Return (r, m)
 
-        -- delimited continuations (hierarchical)
+        -- delimited continuations
         runContT (Yield (Cont (Reset op)) k) = runContT op >>= runContT . k
         runContT (Yield (Cont (Shift fn)) k) = runContT (fn k)
-        runContT (Yield (Cont (Outer rq)) k) = Yield (Cont rq) (runContT . k) 
-        runContT (Yield rq k) = Yield rq (runContT . k)
+        runContT (Yield (Lift rq) k) = Yield rq (runContT . k)
         runContT r@(Return _) = r
 
-        -- cooperative threads (round robin, non-preemptive, hierarchical)
-        --  with per-thread continuations (needed for mutexes, semaphores)
+        -- cooperative threads (round robin, non-preemptive)
+        --  with per-thread continuations (for mutexes, semaphores)
         runThreadT (Yield (Thread op) k):ts = match op with
             (Spawn t) -> runThreadT (k ()):t:ts
             Pause -> runThreadT (ts ++ [k()])
             (CallCC fn) -> runThreadT (fn k):ts
-            (Outer rq) -> Yield (Thread rq) (runThreadT . (:ts) . k)
-        runThreadT (Yield rq k):ts = Yield rq (runThreadT . (:ts) . k)
+        runThreadT (Yield (Lift rq) k):ts = Yield rq (runThreadT . (:ts) . k)
         runThreadT (Return ()):ts = runThreadT ts
         runThreadT [] = Return ()
 
-We can also model runners that scope effects. Though, what to do with unhandled requests isn't well defined.
+Unfortunately, a stack of handlers does not conveniently compose higher-order behavior. For example, in case of `(Lift (Cont (Reset op)))` or `(Lift (Thread (Spawn t)))` the 'op' and 't' only have implicit access to effects defined *below* them on the data stack, and do not receive access to the host's operations. To mitigate this issue, I develop a *Standard Effects Environment* below.
+
+A final handler eliminates the Yield and Return structure:
 
         -- forbid effects from escaping
         runPure (Return r) = r
@@ -187,22 +184,44 @@ We can also model runners that scope effects. Though, what to do with unhandled 
         runChoice (Yield rq k) = error "unhandled request in runChoice"
         runChoice (Return result) = List.singleton result
 
-We'll need a library of useful, reusable handlers. However, I hope we deliberately design handlers with flexibility and extensibility in mind! Regular users should rarely feel the need to write custom handlers. Any 'good' monadic API is essentially architecting a framework.
+*Note:* It would not be difficult to leverage monadic effects for general-purpose programming, like Haskell's IO monad. However, I'm making design decisions under an assumption that there is no runtime. This greatly influences concerns about performance, safety, and staging.
 
-*Note:* It would not be difficult to leverage monadic effects for general-purpose programming, like Haskell. However, I fear dilution of design.
+### Standard Effects Environment
+
+We can develop a general-purpose, extensible, one-size-fits-most effects handler with objects, state, and delimited continuations. 
+
+Instead of a stack of handlers, we maintain an 'object' where each method represents an 'effect' in scope. Users extend effects in scope via mixins. State is a separate dictionary. Access control relies on symbolic names for object interfaces or dict keys. Delimited continuations and state can model flexible control flow (e.g. threads, backtracking), and we capture and restore objects with continuations.
+
+Most effects might have form `(Call m arg)`. Access to state is abstracted through methods. A syntactic sugar should make it convenient to work with standard effects. 
 
 ### Commutative Effects
 
 Monads frequently overspecify order. Many effects can be at partially reordered without influencing outcome, yet with a significant impact on performance. To mitigate this, it is useful to model asynchronous and threaded effects.
 
-Asynchronous effects simply buffer requests to perform later. They may return an abstract future in some cases. Regardless, the handler has an opportunity to reorder requests prior to implementing them.
-
-Threaded effects involve running multiple monadic threads. Like runThreadT but without Pause. Instead, the handler actually examines available requests and makes heuristic decisions about which to handle next, or perhaps handling them all. 
+Asynchronous effects simply buffer some operations to perform later. They may return an abstract future in some cases. Regardless, a handler has an opportunity to reorder requests prior to implementing them. Threaded effects involve running multiple monadic threads. The handler has an opportunity to observe pending requests on multiple threads then reorder them heuristically.
 
         [(Yield BranchingQuery k1), (Yield TightConstraint k2), ...]
         -- constraint-choice runner: let's apply TightConstraint next!
 
-These techniques work well together, e.g. we can buffer asynchronous requests locally per thread, then yield heuristically (to flush the buffer) or when an external response is needed. The main benefit of buffering would be doing more work per step, which is mostly useful in context of spark-based parallelism.
+These techniques work well together, e.g. we can buffer asynchronous requests per thread, then yield heuristically (to flush the buffer) or when an external response is needed. The main benefit of buffering would be doing more work per step, which is useful in context of spark-based parallelism.
+
+*Note:* To buffer state operations, it may be useful to model mirroring, queues, even CRDTs, treating parallel 'threads' similarly to remote nodes that operate on replicas of state then merge (or abort) updates. 
+
+### Effectful Fixpoint
+
+Haskell has a *RecursiveDo* sugar, enabling a result to be used before it is defined. In context of assembly, this is convenient because it enables users to reference forward labels before defining them. This wasn't covered in the paper on Freer monads. I want some attention to encoding, evaluating, and desugaring monadic fixpoint.
+
+We can encode the request as `(Yield (Fix f) k)`, where `f : a -> Eff rq a`. Desugaring can treat 'Fix' as a primitive request.
+
+To evaluate a Fix request requires lazy handling of a future Return value, passing the main result back into 'f' and handling state correctly. Ultimately, 'Fix' must be passed up the handler stack and correctly handled at every step until scoped by a 'runPure' or equivalent.
+
+        runMemT m (Yield (Fix f) k) = Yield (Fix f') k' where
+            f' = runMemT m . f . fst
+            k' (r, m') = runMemT m' (k r)
+
+        runPure (Yield (Fix f) k) = k (fix (runPure . f))
+
+If Fix is not handled, we'll either have some effects that aren't visible to 'f', or an error if we require explicit 'Lift' to forward unhandled requests.
 
 ## Modules
 
@@ -465,7 +484,7 @@ It is relatively convenient to build a constraint system statefully within a mon
 
 ### Visualization
 
-A relevant question is how we express visualizations. Per *integration*, visualizations must align with definitions. We can feasibly support multiple visualizations per definition. But it will likely prove more convienient to bind visualizations to *types*. Then bind types to definitions. This simplifies expression, composition, and reuse of visualizations.
+A relevant question is how we express visualizations. Per *integration*, visualizations must align with definitions. We can feasibly bind named visualizations to definitions, but my intuition is that we'd be better off binding visualizations indirectly to *types*. This should simplify expression, composition, inference, and reuse of visualizations. In turn, this may benefit from a notion of extensible, user-defined types.
 
 To visualize a function, we can visualize the arguments and results and perhaps some intermediate representations during evaluation. In case of curried arguments, we'll want to tie invocations to both call site and origins of terms or definitions site, and support browsing from either location.
 
@@ -477,20 +496,33 @@ We might express theorems as tests with an explicit intention for exhaustive tes
 
 ## Assembly Programming
 
-Instead of machine-code mnemonics being something an assembler *interprets*, we can model them as monadic operations that the assembler *executes*. Each mnemonic can:
+Instead of machine-code mnemonics being data an assembler *interprets*, I propose to model them as monadic operations that the assembler *executes* (via user-defined handler). Aside from writing machine code and maintaining abstract representations of machine state (for abstract interpretation) we may support local declarations of .text, .bss, .data, or .rodata resources. Those resources could be content-addressed, i.e. if declared many times we get the same resource each time, leveraging unique symbols in case of mutable objects.
 
-- write some binary data to intermediate staging location
-- maintain an abstract representation of program state
-- declare ad hoc external structure (.text, .data, .rodata)
-  - i.e. so we can deref 'structures' instead of 'pointers'
+Ideally, there is no need to forward-declare labels for jumps. This implies recursive 'do' notation (or mfix) and staging to defer a computation. 
 
-Ideally, there is no need to forward-declare labels for jumps, leveraging monadic fixpoint and staging to defer the pointer. Ideally, we can also support declarative allocations for static data, stack, and heap, i.e. where the amount allocated depends on future *assumptions* about which fields are present.
+An intriguing possibility is to support declarative allocation of structures on the data stack and heap, similar to types. We could feasibly add fields to a struct based on usage within the assembly. These 'mem types' may be explicitly declared and derived per assembly, i.e. as staged monadic operations almost independent of lambda types.
+
+Ideally, the bulk of an assembly is expressed using objects to support fine-grained overrides and mixins.
 
 *Aside:* Monadic expression is generally more robust and compositional than macros, yet similarly expressive. We are able to define higher-level mneumonics that are inlined.
 
 ## Standard Syntax
 
-This section proposes an initial syntax for ".g" files. It should look and feel like assembly proramming in many cases, and favor vertical structure over deep indentation. Associative structure needs special attention because it enables future operations to influence how much is allocated.
+This section proposes an initial syntax for ".g" files. Some desiderata:
+
+- vertical structure, avoids 'deep' indentation
+- clear sections, i.e. for error isolation or REPL-like output
+- no visible shadowing, names have clear meaning across scopes
+  - may shadow names that aren't visible/mentioned in outer scope
+  - may require explicit 'expect/extern' to bring names into scope
+- clear distinction for introduce vs. override of names
+  - may enforce this in the underlying syntax 
+- machine-code mnemonic sequences *looks and feels* like assembly
+- lightweight, composable syntax for multi-line and computed text
+  - possibly a monadic syntactic sugar? or extension thereof?
+- user-defined types and object interfaces
+  - possible type-indexed behavior bound to named types?
+- objects may use explicit 'self' and 'base'?
 
 
 
