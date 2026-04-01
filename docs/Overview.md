@@ -137,91 +137,107 @@ We can specialize the monadic operators for our only monad. Our untyped lambda c
         (Return a) >>= k = k a
         k1 >>> k2 = (>>= k2) . k1
 
-Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition `>>>` is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. Ideally, the assembler optimizes this, e.g. by acceleration of `>>>`. Tail-call optimization will also be desirable.
+Effectively, '>>=' captures the continuation into 'Yield'. Unfortunately, the Kleisli composition `>>>` is left-associative, i.e. `((((k1 >>> k2) >>> k3) >>> k4) >>> k5)`. Right-associative `(k1 >>> (k2 >>> (k3 >>> (k4 >>> k5))))` performance is vastly superior. Ideally, the assembler optimizes this, e.g. by acceleration of `>>>`.
 
-Behavior is embodied in the runner or handler. Almost any effect can be modeled, the main exception being race conditions. It is feasible to compose effects as a 'stack' of handlers. I wrote a few examples to help myself grasp this: 
+Behavior is embodied in the runner or handler. Almost any effect can be modeled, the primary exception being race conditions. A few examples:
 
-        -- generalize State to extensible, indexed Memory
-        -- use guaranteed-unique symbols to avoid conflicts
-        runMemT m (Yield (Mem idx op) k) = match idx with
-            match op with
-              Get -> runMemT m (k (m.[idx])) 
-              Put v -> runMemT (m with { .[idx] = v }) (k ())
-              Del -> runMemT (m without idx) (k ())
-        runMemT m (Yield (Lift rq) k) = Yield rq (runMemT m . k)
-        runMemT m (Return r) = Return (r, m)
+        -- a reader monad passes an implicit environment
+        runEnv e (Yield Env k) = runEnv e (k e)
+        runEnv e (Return r) = r
+
+        -- a state monad supports update of a state var
+        -- returns final value of state
+        runState s (Yield Get k) = runState s (k s)
+        runState _ (Yield (Put s) k) = runState s (k ())
+        runState s (Return r) = (r,s)
+
+        -- a list monad models lazy, ordered, non-deterministic choice
+        runChoice (Yield xs k) = List.flatMap (runChoice . k) xs
+        runChoice (Return r) = List.singleton r
 
         -- delimited continuations
-        runContT (Yield (Cont (Reset op)) k) = runContT op >>= runContT . k
-        runContT (Yield (Cont (Shift fn)) k) = runContT (fn k)
-        runContT (Yield (Lift rq) k) = Yield rq (runContT . k)
-        runContT r@(Return _) = r
+        runCont (Yield (Shift fn) k) = runCont (fn k)
+        runCont (Yield (Reset op) k) = runCont op >>= runCont . k
+        runCont (Return r) = r
 
-        -- cooperative threads (round robin, non-preemptive)
-        --  with per-thread continuations (for mutexes, semaphores)
-        runThreadT (Yield (Thread op) k):ts = match op with
-            (Spawn t) -> runThreadT (k ()):t:ts
-            Pause -> runThreadT (ts ++ [k()])
-            (CallCC fn) -> runThreadT (fn k):ts
-        runThreadT (Yield (Lift rq) k):ts = Yield rq (runThreadT . (:ts) . k)
-        runThreadT (Return ()):ts = runThreadT ts
-        runThreadT [] = Return ()
+It is possible to compose some effects as a 'monad transformer' stack. In this case, we could support explicit 'Lift' or just forward any unhandled requests. Example:
 
-Unfortunately, a stack of handlers does not conveniently compose higher-order behavior. For example, in case of `(Lift (Cont (Reset op)))` or `(Lift (Thread (Spawn t)))` the 'op' and 't' only have implicit access to effects defined *below* them on the data stack, and do not receive access to the host's operations. To mitigate this issue, I develop a *Standard Effects Environment* below.
+        -- environment transformer with implicit Lift
+        runEnvT e (Yield Env k) = runEnvT e (k e)
+        runEnvT e (Yield rq k) = Yield rq (runEnvT e . k)
+        runEnvT _ r@(Return _) = r
 
-A final handler eliminates the Yield and Return structure:
+        -- state transformer with explicit Lift
+        runStateT s (Yield Get k) = runStateT s (k s)
+        runStateT _ (Yield (Put s) k) = runStateT s (k ())
+        runStateT s (Yield (Lift rq) k) = Yield rq (runStateT s . k)
+        runStateT s (Return r) = (r,s)
 
-        -- forbid effects from escaping
+If all effects are handled, we can add a runPure to extract the final result.
+
         runPure (Return r) = r
-        runPure (Yield rq k) = error "unhandled request in runPure" 
- 
-        runMem m = runPure . runMemT m
-        runCont = runPure . runContT
-        -- pure 'runThread' is useless
+        runPure (Yield rq k) = error "unhandled effect in runPure"
 
-        -- pure choice can be heavily optimized with laziness
-        runChoice (Yield (Choice xs) k) = List.flatMap (runChoice . k) xs
-        runChoice (Yield rq k) = error "unhandled request in runChoice"
-        runChoice (Return result) = List.singleton result
+        runEnv e = runPure . runEnvT e
+        runState s = runPure . runStateT s
 
-*Note:* It would not be difficult to leverage monadic effects for general-purpose programming, like Haskell's IO monad. However, I'm making design decisions under an assumption that there is no runtime. This greatly influences concerns about performance, safety, and staging.
+However, this doesn't generalize nicely to all effects. For example, it is difficult to preserve laziness or support backtracking with a runChoiceT. Also, it doesn't compose conveniently with 'higher order' effects, e.g. in case of runCont and runStateT, in `(Lift (Reset op))`, the 'op' does not receive access to state. A practical solution is a standard, one-size-fits-most, imperative effects API - see *Standard Effects*.
 
-### Standard Effects Environment
-
-We can develop a general-purpose, extensible, one-size-fits-most effects handler with objects, state, and delimited continuations. 
-
-Instead of a stack of handlers, we maintain an 'object' where each method represents an 'effect' in scope. Users extend effects in scope via mixins. State is a separate dictionary. Access control relies on symbolic names for object interfaces or dict keys. Delimited continuations and state can model flexible control flow (e.g. threads, backtracking), and we capture and restore objects with continuations.
-
-Most effects might have form `(Call m arg)`. Access to state is abstracted through methods. A syntactic sugar should make it convenient to work with standard effects. 
-
-### Commutative Effects
-
-Monads frequently overspecify order. Many effects can be at partially reordered without influencing outcome, yet with a significant impact on performance. To mitigate this, it is useful to model asynchronous and threaded effects.
-
-Asynchronous effects simply buffer some operations to perform later. They may return an abstract future in some cases. Regardless, a handler has an opportunity to reorder requests prior to implementing them. Threaded effects involve running multiple monadic threads. The handler has an opportunity to observe pending requests on multiple threads then reorder them heuristically.
-
-        [(Yield BranchingQuery k1), (Yield TightConstraint k2), ...]
-        -- constraint-choice runner: let's apply TightConstraint next!
-
-These techniques work well together, e.g. we can buffer asynchronous requests per thread, then yield heuristically (to flush the buffer) or when an external response is needed. The main benefit of buffering would be doing more work per step, which is useful in context of spark-based parallelism.
-
-*Note:* To buffer state operations, it may be useful to model mirroring, queues, even CRDTs, treating parallel 'threads' similarly to remote nodes that operate on replicas of state then merge (or abort) updates. 
+*Note:* It is not difficult to model an IO monad with access to the filesystem, network, etc.. However, designing for runtime interaction greatly amplifies concerns about performance and safety, and complicates reproducibility and caching. In context of assembly, we use monadic effects as a convenient basis for abstraction and program composition, but ultimately the handler is 'pure'.
 
 ### Effectful Fixpoint
 
-Haskell has a *RecursiveDo* sugar, enabling a result to be used before it is defined. In context of assembly, this is convenient because it enables users to reference forward labels before defining them. This wasn't covered in the paper on Freer monads. I want some attention to encoding, evaluating, and desugaring monadic fixpoint.
-
-We can encode the request as `(Yield (Fix f) k)`, where `f : a -> Eff rq a`. Desugaring can treat 'Fix' as a primitive request.
+Haskell has *MonadFix* and a *RecursiveDo* syntactic sugar, enabling a result to be used before it is defined. In context of assembly, this would be convenient because it enables users to reference forward to labels for branches or jumps. We might encode this as `(Yield (Fix f) k)` where `f : a -> Eff rq a`. 
 
 To evaluate a Fix request requires lazy handling of a future Return value, passing the main result back into 'f' and handling state correctly. Ultimately, 'Fix' must be passed up the handler stack and correctly handled at every step until scoped by a 'runPure' or equivalent.
 
-        runMemT m (Yield (Fix f) k) = Yield (Fix f') k' where
-            f' = runMemT m . f . fst
-            k' (r, m') = runMemT m' (k r)
+        runStateT s (Yield (Fix f) k) = Yield (Fix f') k' where
+            f' = runStateT s . f . fst
+            k' (r, s') = runStateT s' (k r)
 
-        runPure (Yield (Fix f) k) = k (fix (runPure . f))
+        runPure (Yield (Fix f) k) = runPure (k (fix (runPure . f)))
 
-If Fix is not handled, we'll either have some effects that aren't visible to 'f', or an error if we require explicit 'Lift' to forward unhandled requests.
+Fixpoint is not compatible with all effects. But it may be feasible to restrict troublesome effects within scope of 'Fix'.
+
+### Standard Effects
+
+Instead of composing custom handlers, we can provide a general-purpose handler for procedural programming then build almost everything upon it. I believe four effects are sufficient for most use cases: environment, state, continuations, and fixpoint. Environment and state cover common dataflow patterns, while continuations support flexible control flow. Fixpoint is niche but nice for assembly. A viable handler:
+
+        run e s = runFixCont True . runEnvStateT e s
+
+        -- restricts Shift in scope of Fix (modulo Reset)
+        runFixCont b (Return r) = r
+        runFixCont b (Yield rq k) = match rq with
+            Shift fn ->
+                if b then runFixCont b (fn k) else
+                error "cannot Shift in current context"
+            Reset op -> runFixCont True op >>= runFixCont b . k
+            Fix f -> runFixCont b (k (fix (runFixCont False . f)))
+            _ -> error "unhandled request in runFixCont"
+
+        -- I assume 99% of requests are Get, Set, Env.
+        -- We'll recognize and wrap Fix, Shift, Reset.
+        runEnvStateT e s (Return r) = Return (r,s)
+        runEnvStateT e s (Yield rq k) = match rq with
+            Get -> runEnvStateT e s (k s)
+            (Set s') -> runEnvStateT e s' (k ())
+            Env -> runEnvStateT e s (k e)
+            (With e' op) ->
+                runEnvStateT e' s op >>= \ (r,s') -> 
+                runEnvStateT e s' (k r)
+            (Fix f) -> Yield (Fix f') k' where
+                f' = runEnvStateT e s . f . fst
+                k' (r,s') = runEnvStateT e s' (k r)
+            (Shift fn) -> Yield (Shift fn') k' where
+                fn' = runEnvStateT e s . fn
+                k' (r,s') = runEnvStateT e s' (k r)
+            (Reset op) -> Yield (Reset op') k' where
+                op' = runEnvStateT e s op
+                k' (r,s') = runEnvStateT e s' (k r)
+            (Lift rq) -> Yield rq (runEnvStateT e s . k)
+            _ -> error "unhandled request in runEnvStateT"
+
+For extensibility, we can model the environment as an *Object* and environment manipulations as *mixins*. And *state* should be modeled as a *dictionary*, serving as a key-value database or heap, using symbolic keys for access control. The ".g" syntax may provide syntactic sugar that assumes these conventions.
 
 ## Modules
 
